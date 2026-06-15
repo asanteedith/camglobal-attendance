@@ -1,5 +1,5 @@
 telethon
-supabase==2.4.0
+supabase==0.7.0
 python-dotenv
 openai
 httpx==0.25.0
