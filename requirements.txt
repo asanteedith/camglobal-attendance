@@ -1,5 +1,4 @@
-telethon
-supabase
-python-dotenv
-openai
-httpx
+telethon>=1.36.0
+supabase>=2.0.0
+python-dotenv>=1.0.0
+openai>=1.0.0
