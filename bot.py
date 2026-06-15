@@ -132,18 +132,13 @@ def get_or_create_meeting(chat_id, group_type):
     return m, mt
 
 def get_or_create_member(tg_user_id, display_name, first_name='', last_name=''):
+    # Only track members already linked in Supabase (cam_visitor, cam_sons, cam_family)
+    # Never auto-create — unlinked visitors are ignored
     rows = sb_get('members', {'telegram_user_id': f'eq.{tg_user_id}'})
     if rows:
         return rows[0]['id']
-    result = sb_post('members', {
-        'telegram_user_id': tg_user_id,
-        'display_name':     display_name or f'User {tg_user_id}',
-        'first_name':       first_name,
-        'last_name':        last_name,
-    })
-    m = result[0] if isinstance(result, list) else result
-    log.info(f'New member: {display_name}')
-    return m['id']
+    log.info(f'Ignoring unlinked user: {display_name} ({tg_user_id})')
+    return None
 
 def record_voice_event(meeting_id, member_id, tg_user_id, event_type):
     sb_post('voice_events', {
