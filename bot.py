@@ -1,37 +1,29 @@
 """
-CAMGlobal Attendance Bot
-Monitors Telegram voice/video chats and tracks attendance automatically.
-Deployed on Railway.
+CAMGlobal Attendance Bot v2
+Uses supabase==1.2.0 compatible API
 """
 
 import os
 import asyncio
 import logging
+import requests
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import (
-    UpdateGroupCallParticipants,
-    MessageMediaPoll,
-)
-from supabase import create_client, Client
+from telethon.tl.types import UpdateGroupCallParticipants
 
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
 # ── Config ───────────────────────────────────────────────────
 API_ID       = int(os.environ['TELEGRAM_API_ID'])
 API_HASH     = os.environ['TELEGRAM_API_HASH']
 SESSION_NAME = os.environ.get('SESSION_NAME', 'camglobal_bot')
-SUPABASE_URL = os.environ['SUPABASE_URL']
-SUPABASE_KEY = os.environ['SUPABASE_SERVICE_KEY']  # service role key on Railway
+SUPABASE_URL = os.environ['SUPABASE_URL'].rstrip('/')
+SUPABASE_KEY = os.environ['SUPABASE_SERVICE_KEY']
 
-# CAMGlobal Telegram group IDs
 GROUP_IDS = {
     -1001433101619: 'main',
     -5237009034:    'rise',
@@ -39,234 +31,173 @@ GROUP_IDS = {
     -1001510684437: 'family',
 }
 
-# ── Supabase client ──────────────────────────────────────────
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 # ── Telethon client ──────────────────────────────────────────
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# ── In-memory active meetings cache ─────────────────────────
-# { telegram_chat_id: { meeting_id, scheduled_start, scheduled_end,
-#                       grace_join_min, grace_exit_min,
-#                       present_threshold, partial_threshold } }
+# ── Active meetings cache ────────────────────────────────────
 active_meetings: dict = {}
 
+# ── Supabase REST helpers (no SDK — direct HTTP) ─────────────
+HEADERS = {
+    'apikey': SUPABASE_KEY,
+    'Authorization': f'Bearer {SUPABASE_KEY}',
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation',
+}
+
+def sb_get(table, params=None):
+    r = requests.get(f'{SUPABASE_URL}/rest/v1/{table}', headers=HEADERS, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def sb_post(table, data):
+    r = requests.post(f'{SUPABASE_URL}/rest/v1/{table}', headers=HEADERS, json=data, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def sb_patch(table, match_params, data):
+    r = requests.patch(f'{SUPABASE_URL}/rest/v1/{table}', headers=HEADERS, params=match_params, json=data, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def sb_upsert(table, data, on_conflict=None):
+    headers = {**HEADERS, 'Prefer': 'resolution=merge-duplicates,return=representation'}
+    params = {}
+    if on_conflict:
+        params['on_conflict'] = on_conflict
+    r = requests.post(f'{SUPABASE_URL}/rest/v1/{table}', headers=headers, params=params, json=data, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
 # ════════════════════════════════════════════════════════════
-# MEETING MANAGEMENT
+# UTILITIES
 # ════════════════════════════════════════════════════════════
 
-def get_current_utc() -> datetime:
+def now_utc():
     return datetime.now(timezone.utc)
 
-
-def find_meeting_type(group_type: str, now: datetime) -> dict | None:
-    """Find which meeting type matches the current time for a group."""
-    dow = now.weekday()  # 0=Mon … 6=Sun
-    time_now = now.time().replace(second=0, microsecond=0)
-
-    res = supabase.table('meeting_types').select('*').eq(
-        'group_type', group_type
-    ).eq('is_active', True).execute()
-
-    for mt in res.data:
+def find_meeting_type(group_type, now):
+    dow = now.weekday()
+    time_str = now.strftime('%H:%M:%S')
+    rows = sb_get('meeting_types', {'group_type': f'eq.{group_type}', 'is_active': 'eq.true'})
+    for mt in rows:
         days = mt.get('day_of_week') or []
         if dow not in days:
             continue
-        start = datetime.strptime(mt['start_time'], '%H:%M:%S').time()
-        end   = datetime.strptime(mt['end_time'],   '%H:%M:%S').time()
-
-        # Handle meetings that cross midnight (e.g. Sons Session 23:00–02:00)
+        start = mt['start_time']
+        end   = mt['end_time']
         if end < start:
-            if time_now >= start or time_now <= end:
+            if time_str >= start or time_str <= end:
                 return mt
         else:
-            if start <= time_now <= end:
+            if start <= time_str <= end:
                 return mt
     return None
 
-
-def get_or_create_meeting(chat_id: int, group_type: str) -> dict | None:
-    """Get or create a meeting record for the current session."""
-    now = get_current_utc()
+def get_or_create_meeting(chat_id, group_type):
+    now = now_utc()
     mt  = find_meeting_type(group_type, now)
     if not mt:
-        log.info(f'No meeting type matched for group {group_type} at {now.time()}')
-        return None
+        log.info(f'No meeting type matched for {group_type} at {now.strftime("%H:%M")}')
+        return None, None
 
-    # Get telegram_group_id
-    grp = supabase.table('telegram_groups').select('id').eq(
-        'telegram_chat_id', chat_id
-    ).single().execute()
-    if not grp.data:
-        log.warning(f'Group {chat_id} not found in telegram_groups')
-        return None
-    tg_group_id = grp.data['id']
+    grp_rows = sb_get('telegram_groups', {'telegram_chat_id': f'eq.{chat_id}'})
+    if not grp_rows:
+        log.warning(f'Group {chat_id} not in telegram_groups')
+        return None, None
+    tg_group_id = grp_rows[0]['id']
 
-    # Build scheduled window
-    start_t = datetime.strptime(mt['start_time'], '%H:%M:%S').time()
-    end_t   = datetime.strptime(mt['end_time'],   '%H:%M:%S').time()
-    s_start = now.replace(hour=start_t.hour, minute=start_t.minute, second=0, microsecond=0)
-    s_end   = now.replace(hour=end_t.hour,   minute=end_t.minute,   second=0, microsecond=0)
-
-    # If end is before start (crosses midnight), end is next day
+    start_t = mt['start_time'][:5]
+    end_t   = mt['end_time'][:5]
+    sh, sm  = map(int, start_t.split(':'))
+    eh, em  = map(int, end_t.split(':'))
+    s_start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    s_end   = now.replace(hour=eh, minute=em, second=0, microsecond=0)
     if s_end < s_start:
         s_end += timedelta(days=1)
 
-    # Check if meeting already exists for today
-    existing = supabase.table('meetings').select('*').eq(
-        'meeting_type_id', mt['id']
-    ).eq('telegram_group_id', tg_group_id).gte(
-        'scheduled_start', s_start.isoformat()
-    ).lte('scheduled_start', (s_start + timedelta(hours=1)).isoformat()).execute()
+    existing = sb_get('meetings', {
+        'meeting_type_id':  f'eq.{mt["id"]}',
+        'telegram_group_id': f'eq.{tg_group_id}',
+        'scheduled_start':  f'gte.{(s_start - timedelta(hours=1)).isoformat()}',
+        'status':           'neq.cancelled',
+    })
+    if existing:
+        m = existing[0]
+        if m['status'] == 'scheduled':
+            sb_patch('meetings', {'id': f'eq.{m["id"]}'}, {'status': 'live', 'actual_start': now.isoformat()})
+        return m, mt
 
-    if existing.data:
-        meeting = existing.data[0]
-        # Update status to live if scheduled
-        if meeting['status'] == 'scheduled':
-            supabase.table('meetings').update({
-                'status': 'live',
-                'actual_start': now.isoformat()
-            }).eq('id', meeting['id']).execute()
-        return meeting
-
-    # Create new meeting
-    new_meeting = supabase.table('meetings').insert({
-        'meeting_type_id':  mt['id'],
+    new_m = sb_post('meetings', {
+        'meeting_type_id':   mt['id'],
         'telegram_group_id': tg_group_id,
-        'title':            mt['name'],
-        'scheduled_start':  s_start.isoformat(),
-        'scheduled_end':    s_end.isoformat(),
-        'actual_start':     now.isoformat(),
-        'status':           'live',
-    }).execute()
+        'title':             mt['name'],
+        'scheduled_start':   s_start.isoformat(),
+        'scheduled_end':     s_end.isoformat(),
+        'actual_start':      now.isoformat(),
+        'status':            'live',
+    })
+    log.info(f'Created meeting: {mt["name"]}')
+    return (new_m[0] if isinstance(new_m, list) else new_m), mt
 
-    log.info(f'Created meeting: {mt["name"]} for group {group_type}')
-    return new_meeting.data[0] if new_meeting.data else None
-
-
-def cache_meeting(chat_id: int, meeting: dict, mt: dict):
-    """Cache active meeting details for fast lookup."""
-    active_meetings[chat_id] = {
-        'meeting_id':         meeting['id'],
-        'scheduled_start':    meeting['scheduled_start'],
-        'scheduled_end':      meeting['scheduled_end'],
-        'grace_join_min':     mt.get('grace_join_minutes', 15),
-        'grace_exit_min':     mt.get('grace_exit_minutes', 20),
-        'present_threshold':  mt.get('present_threshold_pct', 80),
-        'partial_threshold':  mt.get('partial_threshold_pct', 50),
-    }
-
-
-# ════════════════════════════════════════════════════════════
-# MEMBER LOOKUP
-# ════════════════════════════════════════════════════════════
-
-def get_or_create_member(telegram_user_id: int, display_name: str,
-                          first_name: str = '', last_name: str = '') -> str | None:
-    """Get member UUID by Telegram user ID, create if new."""
-    res = supabase.table('members').select('id').eq(
-        'telegram_user_id', telegram_user_id
-    ).execute()
-
-    if res.data:
-        return res.data[0]['id']
-
-    # Create new member
-    new_m = supabase.table('members').insert({
-        'telegram_user_id': telegram_user_id,
-        'display_name':     display_name or f'User {telegram_user_id}',
+def get_or_create_member(tg_user_id, display_name, first_name='', last_name=''):
+    rows = sb_get('members', {'telegram_user_id': f'eq.{tg_user_id}'})
+    if rows:
+        return rows[0]['id']
+    new_m = sb_post('members', {
+        'telegram_user_id': tg_user_id,
+        'display_name':     display_name or f'User {tg_user_id}',
         'first_name':       first_name,
         'last_name':        last_name,
-    }).execute()
+    })
+    result = new_m[0] if isinstance(new_m, list) else new_m
+    log.info(f'New member: {display_name}')
+    return result['id']
 
-    if new_m.data:
-        log.info(f'New member created: {display_name} ({telegram_user_id})')
-        return new_m.data[0]['id']
-    return None
-
-
-# ════════════════════════════════════════════════════════════
-# VOICE EVENT RECORDING
-# ════════════════════════════════════════════════════════════
-
-def record_voice_event(meeting_id: str, member_id: str,
-                        telegram_user_id: int, event_type: str):
-    """Record a join or leave event."""
-    supabase.table('voice_events').insert({
+def record_voice_event(meeting_id, member_id, tg_user_id, event_type):
+    sb_post('voice_events', {
         'meeting_id':       meeting_id,
         'member_id':        member_id,
-        'telegram_user_id': telegram_user_id,
+        'telegram_user_id': tg_user_id,
         'event_type':       event_type,
-        'event_time':       get_current_utc().isoformat(),
-    }).execute()
-    log.info(f'Voice event: {event_type} | member {member_id} | meeting {meeting_id}')
+        'event_time':       now_utc().isoformat(),
+    })
+    log.info(f'{event_type.upper()} | {member_id[:8]}')
 
-
-# ════════════════════════════════════════════════════════════
-# ATTENDANCE CALCULATION
-# ════════════════════════════════════════════════════════════
-
-def calculate_and_save_attendance(meeting_id: str, member_id: str,
-                                   meeting_cache: dict):
-    """Calculate attendance status and save/update attendance record."""
-    now = get_current_utc()
-
-    # Get all voice events for this member in this meeting
-    events_res = supabase.table('voice_events').select('*').eq(
-        'meeting_id', meeting_id
-    ).eq('member_id', member_id).order('event_time').execute()
-
-    events_data = events_res.data
-    if not events_data:
+def calculate_attendance(meeting_id, member_id, cache):
+    now = now_utc()
+    evts = sb_get('voice_events', {
+        'meeting_id': f'eq.{meeting_id}',
+        'member_id':  f'eq.{member_id}',
+        'order':      'event_time.asc',
+    })
+    if not evts:
         return
 
-    # Find first join and last leave
-    joins  = [e for e in events_data if e['event_type'] == 'join']
-    leaves = [e for e in events_data if e['event_type'] == 'leave']
-
+    joins  = [e for e in evts if e['event_type'] == 'join']
+    leaves = [e for e in evts if e['event_type'] == 'leave']
     if not joins:
         return
 
-    first_join  = datetime.fromisoformat(joins[0]['event_time'])
-    last_leave  = datetime.fromisoformat(leaves[-1]['event_time']) if leaves else None
+    first_join  = datetime.fromisoformat(joins[0]['event_time'].replace('Z', '+00:00'))
+    last_leave  = datetime.fromisoformat(leaves[-1]['event_time'].replace('Z', '+00:00')) if leaves else None
 
-    # Parse scheduled times
-    s_start = datetime.fromisoformat(meeting_cache['scheduled_start'])
-    s_end   = datetime.fromisoformat(meeting_cache['scheduled_end'])
+    s_start = datetime.fromisoformat(cache['scheduled_start'].replace('Z', '+00:00'))
+    s_end   = datetime.fromisoformat(cache['scheduled_end'].replace('Z', '+00:00'))
+    eff_leave = last_leave or now
 
-    # If no leave recorded yet, use current time for live calculation
-    effective_leave = last_leave or now
-
-    # Duration
-    duration_min = max(0, int((effective_leave - first_join).total_seconds() / 60))
+    duration_min = max(0, int((eff_leave - first_join).total_seconds() / 60))
     meeting_min  = max(1, int((s_end - s_start).total_seconds() / 60))
     pct          = min(100, round((duration_min / meeting_min) * 100))
 
-    # Grace windows
-    grace_join = s_start + timedelta(minutes=meeting_cache['grace_join_min'])
-    grace_exit = s_end   - timedelta(minutes=meeting_cache['grace_exit_min'])
+    grace_join = s_start + timedelta(minutes=cache['grace_join_min'])
+    grace_exit = s_end   - timedelta(minutes=cache['grace_exit_min'])
 
-    # Determine status
-    joined_on_time  = first_join <= grace_join
-    stayed_to_end   = (last_leave is None) or (last_leave >= grace_exit)
-    above_present   = pct >= meeting_cache['present_threshold']
-    above_partial   = pct >= meeting_cache['partial_threshold']
+    joined_on_time = first_join <= grace_join
+    stayed_to_end  = (last_leave is None) or (last_leave >= grace_exit)
+    auto_marked    = joined_on_time and stayed_to_end and pct >= cache['present_threshold']
 
-    if joined_on_time and stayed_to_end and above_present:
-        status     = 'present'
-        auto_marked = True
-    elif above_partial:
-        status     = 'partial'
-        auto_marked = False
-    else:
-        status     = 'absent'
-        auto_marked = False
-
-    # Upsert attendance record
-    existing = supabase.table('attendance_records').select('id').eq(
-        'meeting_id', meeting_id
-    ).eq('member_id', member_id).execute()
+    status = 'present' if auto_marked else ('partial' if pct >= cache['partial_threshold'] else 'absent')
 
     record_data = {
         'meeting_id':             meeting_id,
@@ -280,285 +211,157 @@ def calculate_and_save_attendance(meeting_id: str, member_id: str,
         'auto_marked':            auto_marked,
         'calculated_at':          now.isoformat(),
     }
+    sb_upsert('attendance_records', record_data, on_conflict='meeting_id,member_id')
 
-    if existing.data:
-        supabase.table('attendance_records').update(record_data).eq(
-            'id', existing.data[0]['id']
-        ).execute()
-    else:
-        supabase.table('attendance_records').insert(record_data).execute()
-
-    # If not auto-marked, add to admin review queue
     if not auto_marked:
-        att_res = supabase.table('attendance_records').select('id').eq(
-            'meeting_id', meeting_id
-        ).eq('member_id', member_id).single().execute()
-
-        if att_res.data:
-            # Check if already in queue
-            in_queue = supabase.table('attendance_review_queue').select('id').eq(
-                'attendance_record_id', att_res.data['id']
-            ).eq('review_status', 'pending').execute()
-
-            if not in_queue.data:
+        att_rows = sb_get('attendance_records', {
+            'meeting_id': f'eq.{meeting_id}',
+            'member_id':  f'eq.{member_id}',
+        })
+        if att_rows:
+            att_id = att_rows[0]['id']
+            in_queue = sb_get('attendance_review_queue', {
+                'attendance_record_id': f'eq.{att_id}',
+                'review_status':        'eq.pending',
+            })
+            if not in_queue:
                 reason = (
-                    f'Joined {"on time" if joined_on_time else "late"}, '
+                    f'{"On time" if joined_on_time else "Late"}, '
                     f'{"stayed to end" if stayed_to_end else "left early"}, '
-                    f'{pct}% attendance ({duration_min} min of {meeting_min} min)'
+                    f'{pct}% ({duration_min}/{meeting_min} min)'
                 )
-                supabase.table('attendance_review_queue').insert({
-                    'attendance_record_id': att_res.data['id'],
+                sb_post('attendance_review_queue', {
+                    'attendance_record_id': att_id,
                     'meeting_id':           meeting_id,
                     'member_id':            member_id,
                     'suggested_status':     status,
                     'reason':               reason,
                     'confidence':           round(pct / 100, 2),
-                }).execute()
-                log.info(f'Added to review queue: {member_id} | {status} | {reason}')
+                })
+                log.info(f'Review queue: {status} | {reason}')
 
-    log.info(
-        f'Attendance: {member_id} | {status} | {pct}% | '
-        f'auto={auto_marked} | {duration_min}min'
-    )
-
+    log.info(f'Attendance: {status} | {pct}% | auto={auto_marked}')
 
 # ════════════════════════════════════════════════════════════
-# TELEGRAM EVENT HANDLERS
+# TELEGRAM HANDLERS
 # ════════════════════════════════════════════════════════════
 
 @client.on(events.Raw(UpdateGroupCallParticipants))
-async def on_voice_participant(event):
-    """Fires when someone joins or leaves a Telegram voice/video chat."""
+async def on_voice(event):
     try:
         chat_id = None
-
-        # Try to get chat_id from the event
         if hasattr(event, 'call') and hasattr(event.call, 'id'):
-            # Look up which chat this call belongs to
             for gid in GROUP_IDS:
                 try:
                     full = await client(GetFullChannelRequest(gid))
-                    if (full.full_chat.call and
-                            full.full_chat.call.id == event.call.id):
+                    if full.full_chat.call and full.full_chat.call.id == event.call.id:
                         chat_id = gid
                         break
                 except Exception:
                     continue
 
-        if chat_id is None or chat_id not in GROUP_IDS:
+        if not chat_id or chat_id not in GROUP_IDS:
             return
 
         group_type = GROUP_IDS[chat_id]
 
-        # Get or create meeting
         if chat_id not in active_meetings:
-            meeting = get_or_create_meeting(chat_id, group_type)
-            if not meeting:
+            meeting, mt = get_or_create_meeting(chat_id, group_type)
+            if not meeting or not mt:
                 return
-            # Get meeting type for cache
-            mt_res = supabase.table('meeting_types').select('*').eq(
-                'id', meeting['meeting_type_id']
-            ).single().execute()
-            if mt_res.data:
-                cache_meeting(chat_id, meeting, mt_res.data)
+            active_meetings[chat_id] = {
+                'meeting_id':       meeting['id'],
+                'scheduled_start':  meeting['scheduled_start'],
+                'scheduled_end':    meeting['scheduled_end'],
+                'grace_join_min':   mt.get('grace_join_minutes', 15),
+                'grace_exit_min':   mt.get('grace_exit_minutes', 20),
+                'present_threshold': mt.get('present_threshold_pct', 80),
+                'partial_threshold': mt.get('partial_threshold_pct', 50),
+            }
 
-        if chat_id not in active_meetings:
-            return
+        cache      = active_meetings[chat_id]
+        meeting_id = cache['meeting_id']
 
-        meeting_cache = active_meetings[chat_id]
-        meeting_id    = meeting_cache['meeting_id']
-
-        # Process each participant update
-        for participant in event.participants:
-            tg_user_id = participant.peer.user_id if hasattr(
-                participant.peer, 'user_id'
-            ) else None
-
-            if not tg_user_id:
+        for p in event.participants:
+            tg_uid = getattr(p.peer, 'user_id', None)
+            if not tg_uid:
                 continue
 
-            # Determine join or leave
-            if participant.left:
-                event_type = 'leave'
-            else:
-                event_type = 'join'
+            event_type = 'leave' if p.left else 'join'
 
-            # Get user info
             try:
-                user = await client.get_entity(tg_user_id)
-                display_name = f'{user.first_name or ""} {user.last_name or ""}'.strip()
-                first_name   = user.first_name or ''
-                last_name    = user.last_name  or ''
+                user = await client.get_entity(tg_uid)
+                name = f'{user.first_name or ""} {user.last_name or ""}'.strip()
+                fn   = user.first_name or ''
+                ln   = user.last_name  or ''
             except Exception:
-                display_name = f'User {tg_user_id}'
-                first_name   = ''
-                last_name    = ''
+                name, fn, ln = f'User {tg_uid}', '', ''
 
-            # Get or create member
-            member_id = get_or_create_member(
-                tg_user_id, display_name, first_name, last_name
-            )
+            member_id = get_or_create_member(tg_uid, name, fn, ln)
             if not member_id:
                 continue
 
-            # Record event
-            record_voice_event(meeting_id, member_id, tg_user_id, event_type)
-
-            # Recalculate attendance on every event
-            calculate_and_save_attendance(meeting_id, member_id, meeting_cache)
+            record_voice_event(meeting_id, member_id, tg_uid, event_type)
+            calculate_attendance(meeting_id, member_id, cache)
 
     except Exception as e:
-        log.error(f'Error in voice participant handler: {e}', exc_info=True)
-
-
-@client.on(events.NewMessage(chats=list(GROUP_IDS.keys())))
-async def on_message(event):
-    """Track message engagement during meetings."""
-    try:
-        chat_id = event.chat_id
-        if chat_id not in active_meetings:
-            return
-
-        meeting_id = active_meetings[chat_id]['meeting_id']
-        sender     = await event.get_sender()
-        if not sender or not hasattr(sender, 'id'):
-            return
-
-        tg_user_id = sender.id
-        member_res = supabase.table('members').select('id').eq(
-            'telegram_user_id', tg_user_id
-        ).execute()
-        if not member_res.data:
-            return
-
-        member_id  = member_res.data[0]['id']
-        event_type = 'poll_vote' if isinstance(
-            event.message.media, MessageMediaPoll
-        ) else 'message'
-
-        supabase.table('engagement_events').insert({
-            'meeting_id':       meeting_id,
-            'member_id':        member_id,
-            'telegram_user_id': tg_user_id,
-            'event_type':       event_type,
-            'event_time':       get_current_utc().isoformat(),
-        }).execute()
-
-    except Exception as e:
-        log.error(f'Error in message handler: {e}', exc_info=True)
-
+        log.error(f'Voice handler error: {e}', exc_info=True)
 
 # ════════════════════════════════════════════════════════════
-# MEETING END — finalise attendance
+# BACKGROUND TASKS
 # ════════════════════════════════════════════════════════════
 
-async def check_meeting_endings():
-    """
-    Background task — runs every 5 minutes.
-    Finalises attendance when a meeting's scheduled end time passes.
-    """
+async def check_endings():
     while True:
-        await asyncio.sleep(300)  # every 5 minutes
+        await asyncio.sleep(300)
         try:
-            now = get_current_utc()
+            now = now_utc()
             for chat_id, cache in list(active_meetings.items()):
-                s_end = datetime.fromisoformat(cache['scheduled_end'])
+                s_end = datetime.fromisoformat(cache['scheduled_end'].replace('Z', '+00:00'))
                 if now > s_end + timedelta(minutes=10):
-                    log.info(f'Meeting ended for chat {chat_id} — finalising attendance')
-
-                    # Mark meeting as ended
-                    supabase.table('meetings').update({
-                        'status':     'ended',
-                        'actual_end': now.isoformat(),
-                    }).eq('id', cache['meeting_id']).execute()
-
-                    # Final attendance calculation for all members
-                    records = supabase.table('attendance_records').select(
-                        'member_id'
-                    ).eq('meeting_id', cache['meeting_id']).execute()
-
-                    for rec in records.data:
-                        calculate_and_save_attendance(
-                            cache['meeting_id'], rec['member_id'], cache
-                        )
-
-                    # Remove from active cache
+                    log.info(f'Finalising meeting for chat {chat_id}')
+                    sb_patch('meetings', {'id': f'eq.{cache["meeting_id"]}'}, {
+                        'status': 'ended', 'actual_end': now.isoformat()
+                    })
+                    recs = sb_get('attendance_records', {'meeting_id': f'eq.{cache["meeting_id"]}'})
+                    for r in recs:
+                        calculate_attendance(cache['meeting_id'], r['member_id'], cache)
                     del active_meetings[chat_id]
-                    log.info(f'Meeting finalised and removed from cache: {chat_id}')
-
         except Exception as e:
-            log.error(f'Error in meeting end check: {e}', exc_info=True)
+            log.error(f'Ending check error: {e}', exc_info=True)
 
-
-# ════════════════════════════════════════════════════════════
-# AT-RISK DETECTION — runs daily
-# ════════════════════════════════════════════════════════════
-
-async def check_at_risk_members():
-    """Check for members with low attendance over last 8 meetings."""
+async def check_at_risk():
     while True:
-        await asyncio.sleep(86400)  # every 24 hours
+        await asyncio.sleep(86400)
         try:
-            log.info('Running at-risk member check...')
-            members_res = supabase.table('members').select(
-                'id, display_name'
-            ).eq('is_active', True).execute()
-
-            for member in members_res.data:
-                mid = member['id']
-
-                # Get last 8 attendance records
-                recs = supabase.table('attendance_records').select(
-                    'status'
-                ).eq('member_id', mid).order(
-                    'calculated_at', desc=True
-                ).limit(8).execute()
-
-                if len(recs.data) < 3:
+            members = sb_get('members', {'is_active': 'eq.true'})
+            for m in members:
+                recs = sb_get('attendance_records', {
+                    'member_id': f'eq.{m["id"]}',
+                    'order':     'calculated_at.desc',
+                    'limit':     '8',
+                })
+                if len(recs) < 3:
                     continue
-
-                present_count = sum(
-                    1 for r in recs.data if r['status'] == 'present'
-                )
-                pct = round((present_count / len(recs.data)) * 100)
-
-                # Count consecutive absences
-                consecutive = 0
-                for r in recs.data:
+                present = sum(1 for r in recs if r['status'] == 'present')
+                pct     = round((present / len(recs)) * 100)
+                consec  = 0
+                for r in recs:
                     if r['status'] in ('absent', 'partial'):
-                        consecutive += 1
+                        consec += 1
                     else:
                         break
-
-                if pct < 50 or consecutive >= 3:
-                    # Upsert at-risk record
-                    existing = supabase.table('at_risk_members').select(
-                        'id'
-                    ).eq('member_id', mid).execute()
-
-                    data = {
-                        'member_id':             mid,
-                        'attendance_pct_last8':  pct,
-                        'consecutive_absences':  consecutive,
-                        'flagged_at':            get_current_utc().isoformat(),
-                        'resolved':              False,
-                    }
-
-                    if existing.data:
-                        supabase.table('at_risk_members').update(data).eq(
-                            'member_id', mid
-                        ).execute()
-                    else:
-                        supabase.table('at_risk_members').insert(data).execute()
-
-                    log.info(
-                        f'At-risk: {member["display_name"]} | '
-                        f'{pct}% | {consecutive} consecutive absences'
-                    )
-
+                if pct < 50 or consec >= 3:
+                    sb_upsert('at_risk_members', {
+                        'member_id':            m['id'],
+                        'attendance_pct_last8': pct,
+                        'consecutive_absences': consec,
+                        'flagged_at':           now_utc().isoformat(),
+                        'resolved':             False,
+                    }, on_conflict='member_id')
+                    log.info(f'At-risk: {m["display_name"]} | {pct}% | {consec} absences')
         except Exception as e:
-            log.error(f'Error in at-risk check: {e}', exc_info=True)
-
+            log.error(f'At-risk check error: {e}', exc_info=True)
 
 # ════════════════════════════════════════════════════════════
 # MAIN
@@ -567,23 +370,17 @@ async def check_at_risk_members():
 async def main():
     log.info('Starting CAMGlobal Attendance Bot...')
     await client.start()
-    log.info('Bot connected to Telegram.')
-
-    # Join all monitored groups to receive events
+    log.info('Connected to Telegram.')
     for chat_id in GROUP_IDS:
         try:
             await client.get_entity(chat_id)
-            log.info(f'Monitoring group: {chat_id}')
+            log.info(f'Monitoring: {chat_id}')
         except Exception as e:
-            log.warning(f'Could not access group {chat_id}: {e}')
-
-    # Start background tasks
-    asyncio.create_task(check_meeting_endings())
-    asyncio.create_task(check_at_risk_members())
-
-    log.info('Bot is running. Listening for voice chat events...')
+            log.warning(f'Cannot access {chat_id}: {e}')
+    asyncio.create_task(check_endings())
+    asyncio.create_task(check_at_risk())
+    log.info('Bot running. Listening for voice chat events...')
     await client.run_until_disconnected()
-
 
 if __name__ == '__main__':
     asyncio.run(main())
