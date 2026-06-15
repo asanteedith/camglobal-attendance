@@ -16,6 +16,7 @@ from telethon.tl.types import (
     MessageMediaPoll,
 )
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 
 load_dotenv()
 logging.basicConfig(
@@ -40,7 +41,11 @@ GROUP_IDS = {
 }
 
 # ── Supabase client ──────────────────────────────────────────
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    options=ClientOptions(auto_refresh_token=False, persist_session=False)
+)
 
 # ── Telethon client ──────────────────────────────────────────
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
