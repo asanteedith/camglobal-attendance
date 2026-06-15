@@ -1,0 +1,11 @@
+# ── Telegram ─────────────────────────────────────────────────
+TELEGRAM_API_ID=your_api_id_here
+TELEGRAM_API_HASH=your_api_hash_here
+SESSION_NAME=camglobal_bot
+
+# ── Supabase ─────────────────────────────────────────────────
+SUPABASE_URL=your_supabase_url_here
+SUPABASE_SERVICE_KEY=your_service_role_key_here
+
+# ── OpenAI ───────────────────────────────────────────────────
+OPENAI_API_KEY=your_openai_api_key_here
