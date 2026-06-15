@@ -1,6 +1,8 @@
 """
-CAMGlobal Attendance Bot v2
-Uses supabase==1.2.0 compatible API
+CAMGlobal Attendance Bot v3
+- No supabase SDK (direct HTTP via requests)
+- Client and handlers created inside main()
+- Works on Render/Railway
 """
 
 import os
@@ -31,13 +33,9 @@ GROUP_IDS = {
     -1001510684437: 'family',
 }
 
-# ── Telethon client (created inside main) ───────────────────
-client = None
-
-# ── Active meetings cache ────────────────────────────────────
 active_meetings: dict = {}
 
-# ── Supabase REST helpers (no SDK — direct HTTP) ─────────────
+# ── Supabase HTTP helpers ────────────────────────────────────
 HEADERS = {
     'apikey': SUPABASE_KEY,
     'Authorization': f'Bearer {SUPABASE_KEY}',
@@ -62,17 +60,12 @@ def sb_patch(table, match_params, data):
 
 def sb_upsert(table, data, on_conflict=None):
     headers = {**HEADERS, 'Prefer': 'resolution=merge-duplicates,return=representation'}
-    params = {}
-    if on_conflict:
-        params['on_conflict'] = on_conflict
+    params = {'on_conflict': on_conflict} if on_conflict else {}
     r = requests.post(f'{SUPABASE_URL}/rest/v1/{table}', headers=headers, params=params, json=data, timeout=10)
     r.raise_for_status()
     return r.json()
 
-# ════════════════════════════════════════════════════════════
-# UTILITIES
-# ════════════════════════════════════════════════════════════
-
+# ── Utilities ────────────────────────────────────────────────
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -98,29 +91,26 @@ def get_or_create_meeting(chat_id, group_type):
     now = now_utc()
     mt  = find_meeting_type(group_type, now)
     if not mt:
-        log.info(f'No meeting type matched for {group_type} at {now.strftime("%H:%M")}')
+        log.info(f'No meeting matched for {group_type} at {now.strftime("%H:%M")}')
         return None, None
 
     grp_rows = sb_get('telegram_groups', {'telegram_chat_id': f'eq.{chat_id}'})
     if not grp_rows:
-        log.warning(f'Group {chat_id} not in telegram_groups')
         return None, None
     tg_group_id = grp_rows[0]['id']
 
-    start_t = mt['start_time'][:5]
-    end_t   = mt['end_time'][:5]
-    sh, sm  = map(int, start_t.split(':'))
-    eh, em  = map(int, end_t.split(':'))
+    sh, sm = map(int, mt['start_time'][:5].split(':'))
+    eh, em = map(int, mt['end_time'][:5].split(':'))
     s_start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
     s_end   = now.replace(hour=eh, minute=em, second=0, microsecond=0)
     if s_end < s_start:
         s_end += timedelta(days=1)
 
     existing = sb_get('meetings', {
-        'meeting_type_id':  f'eq.{mt["id"]}',
+        'meeting_type_id':   f'eq.{mt["id"]}',
         'telegram_group_id': f'eq.{tg_group_id}',
-        'scheduled_start':  f'gte.{(s_start - timedelta(hours=1)).isoformat()}',
-        'status':           'neq.cancelled',
+        'scheduled_start':   f'gte.{(s_start - timedelta(hours=1)).isoformat()}',
+        'status':            'neq.cancelled',
     })
     if existing:
         m = existing[0]
@@ -128,7 +118,7 @@ def get_or_create_meeting(chat_id, group_type):
             sb_patch('meetings', {'id': f'eq.{m["id"]}'}, {'status': 'live', 'actual_start': now.isoformat()})
         return m, mt
 
-    new_m = sb_post('meetings', {
+    result = sb_post('meetings', {
         'meeting_type_id':   mt['id'],
         'telegram_group_id': tg_group_id,
         'title':             mt['name'],
@@ -137,22 +127,23 @@ def get_or_create_meeting(chat_id, group_type):
         'actual_start':      now.isoformat(),
         'status':            'live',
     })
+    m = result[0] if isinstance(result, list) else result
     log.info(f'Created meeting: {mt["name"]}')
-    return (new_m[0] if isinstance(new_m, list) else new_m), mt
+    return m, mt
 
 def get_or_create_member(tg_user_id, display_name, first_name='', last_name=''):
     rows = sb_get('members', {'telegram_user_id': f'eq.{tg_user_id}'})
     if rows:
         return rows[0]['id']
-    new_m = sb_post('members', {
+    result = sb_post('members', {
         'telegram_user_id': tg_user_id,
         'display_name':     display_name or f'User {tg_user_id}',
         'first_name':       first_name,
         'last_name':        last_name,
     })
-    result = new_m[0] if isinstance(new_m, list) else new_m
+    m = result[0] if isinstance(result, list) else result
     log.info(f'New member: {display_name}')
-    return result['id']
+    return m['id']
 
 def record_voice_event(meeting_id, member_id, tg_user_id, event_type):
     sb_post('voice_events', {
@@ -165,7 +156,7 @@ def record_voice_event(meeting_id, member_id, tg_user_id, event_type):
     log.info(f'{event_type.upper()} | {member_id[:8]}')
 
 def calculate_attendance(meeting_id, member_id, cache):
-    now = now_utc()
+    now  = now_utc()
     evts = sb_get('voice_events', {
         'meeting_id': f'eq.{meeting_id}',
         'member_id':  f'eq.{member_id}',
@@ -179,27 +170,27 @@ def calculate_attendance(meeting_id, member_id, cache):
     if not joins:
         return
 
-    first_join  = datetime.fromisoformat(joins[0]['event_time'].replace('Z', '+00:00'))
-    last_leave  = datetime.fromisoformat(leaves[-1]['event_time'].replace('Z', '+00:00')) if leaves else None
+    def parse_dt(s):
+        return datetime.fromisoformat(s.replace('Z', '+00:00'))
 
-    s_start = datetime.fromisoformat(cache['scheduled_start'].replace('Z', '+00:00'))
-    s_end   = datetime.fromisoformat(cache['scheduled_end'].replace('Z', '+00:00'))
-    eff_leave = last_leave or now
+    first_join = parse_dt(joins[0]['event_time'])
+    last_leave = parse_dt(leaves[-1]['event_time']) if leaves else None
+    s_start    = parse_dt(cache['scheduled_start'])
+    s_end      = parse_dt(cache['scheduled_end'])
+    eff_leave  = last_leave or now
 
     duration_min = max(0, int((eff_leave - first_join).total_seconds() / 60))
     meeting_min  = max(1, int((s_end - s_start).total_seconds() / 60))
     pct          = min(100, round((duration_min / meeting_min) * 100))
 
-    grace_join = s_start + timedelta(minutes=cache['grace_join_min'])
-    grace_exit = s_end   - timedelta(minutes=cache['grace_exit_min'])
-
+    grace_join     = s_start + timedelta(minutes=cache['grace_join_min'])
+    grace_exit     = s_end   - timedelta(minutes=cache['grace_exit_min'])
     joined_on_time = first_join <= grace_join
-    stayed_to_end  = (last_leave is None) or (last_leave >= grace_exit)
+    stayed_to_end  = last_leave is None or last_leave >= grace_exit
     auto_marked    = joined_on_time and stayed_to_end and pct >= cache['present_threshold']
+    status         = 'present' if auto_marked else ('partial' if pct >= cache['partial_threshold'] else 'absent')
 
-    status = 'present' if auto_marked else ('partial' if pct >= cache['partial_threshold'] else 'absent')
-
-    record_data = {
+    sb_upsert('attendance_records', {
         'meeting_id':             meeting_id,
         'member_id':              member_id,
         'telegram_user_id':       joins[0].get('telegram_user_id'),
@@ -210,8 +201,7 @@ def calculate_attendance(meeting_id, member_id, cache):
         'status':                 status,
         'auto_marked':            auto_marked,
         'calculated_at':          now.isoformat(),
-    }
-    sb_upsert('attendance_records', record_data, on_conflict='meeting_id,member_id')
+    }, on_conflict='meeting_id,member_id')
 
     if not auto_marked:
         att_rows = sb_get('attendance_records', {
@@ -219,7 +209,7 @@ def calculate_attendance(meeting_id, member_id, cache):
             'member_id':  f'eq.{member_id}',
         })
         if att_rows:
-            att_id = att_rows[0]['id']
+            att_id   = att_rows[0]['id']
             in_queue = sb_get('attendance_review_queue', {
                 'attendance_record_id': f'eq.{att_id}',
                 'review_status':        'eq.pending',
@@ -238,79 +228,9 @@ def calculate_attendance(meeting_id, member_id, cache):
                     'reason':               reason,
                     'confidence':           round(pct / 100, 2),
                 })
-                log.info(f'Review queue: {status} | {reason}')
-
     log.info(f'Attendance: {status} | {pct}% | auto={auto_marked}')
 
-# ════════════════════════════════════════════════════════════
-# TELEGRAM HANDLERS
-# ════════════════════════════════════════════════════════════
-
-@client.on(events.Raw(UpdateGroupCallParticipants))
-async def on_voice(event):
-    try:
-        chat_id = None
-        if hasattr(event, 'call') and hasattr(event.call, 'id'):
-            for gid in GROUP_IDS:
-                try:
-                    full = await client(GetFullChannelRequest(gid))
-                    if full.full_chat.call and full.full_chat.call.id == event.call.id:
-                        chat_id = gid
-                        break
-                except Exception:
-                    continue
-
-        if not chat_id or chat_id not in GROUP_IDS:
-            return
-
-        group_type = GROUP_IDS[chat_id]
-
-        if chat_id not in active_meetings:
-            meeting, mt = get_or_create_meeting(chat_id, group_type)
-            if not meeting or not mt:
-                return
-            active_meetings[chat_id] = {
-                'meeting_id':       meeting['id'],
-                'scheduled_start':  meeting['scheduled_start'],
-                'scheduled_end':    meeting['scheduled_end'],
-                'grace_join_min':   mt.get('grace_join_minutes', 15),
-                'grace_exit_min':   mt.get('grace_exit_minutes', 20),
-                'present_threshold': mt.get('present_threshold_pct', 80),
-                'partial_threshold': mt.get('partial_threshold_pct', 50),
-            }
-
-        cache      = active_meetings[chat_id]
-        meeting_id = cache['meeting_id']
-
-        for p in event.participants:
-            tg_uid = getattr(p.peer, 'user_id', None)
-            if not tg_uid:
-                continue
-
-            event_type = 'leave' if p.left else 'join'
-
-            try:
-                user = await client.get_entity(tg_uid)
-                name = f'{user.first_name or ""} {user.last_name or ""}'.strip()
-                fn   = user.first_name or ''
-                ln   = user.last_name  or ''
-            except Exception:
-                name, fn, ln = f'User {tg_uid}', '', ''
-
-            member_id = get_or_create_member(tg_uid, name, fn, ln)
-            if not member_id:
-                continue
-
-            record_voice_event(meeting_id, member_id, tg_uid, event_type)
-            calculate_attendance(meeting_id, member_id, cache)
-
-    except Exception as e:
-        log.error(f'Voice handler error: {e}', exc_info=True)
-
-# ════════════════════════════════════════════════════════════
-# BACKGROUND TASKS
-# ════════════════════════════════════════════════════════════
-
+# ── Background tasks ─────────────────────────────────────────
 async def check_endings():
     while True:
         await asyncio.sleep(300)
@@ -319,7 +239,7 @@ async def check_endings():
             for chat_id, cache in list(active_meetings.items()):
                 s_end = datetime.fromisoformat(cache['scheduled_end'].replace('Z', '+00:00'))
                 if now > s_end + timedelta(minutes=10):
-                    log.info(f'Finalising meeting for chat {chat_id}')
+                    log.info(f'Finalising meeting {chat_id}')
                     sb_patch('meetings', {'id': f'eq.{cache["meeting_id"]}'}, {
                         'status': 'ended', 'actual_end': now.isoformat()
                     })
@@ -363,22 +283,79 @@ async def check_at_risk():
         except Exception as e:
             log.error(f'At-risk check error: {e}', exc_info=True)
 
-# ════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════
-
+# ── Main ─────────────────────────────────────────────────────
 async def main():
-    global client
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+    # Register handlers inside main so client exists
+    @client.on(events.Raw(UpdateGroupCallParticipants))
+    async def on_voice(event):
+        try:
+            chat_id = None
+            if hasattr(event, 'call') and hasattr(event.call, 'id'):
+                for gid in GROUP_IDS:
+                    try:
+                        full = await client(GetFullChannelRequest(gid))
+                        if full.full_chat.call and full.full_chat.call.id == event.call.id:
+                            chat_id = gid
+                            break
+                    except Exception:
+                        continue
+
+            if not chat_id or chat_id not in GROUP_IDS:
+                return
+
+            group_type = GROUP_IDS[chat_id]
+
+            if chat_id not in active_meetings:
+                meeting, mt = get_or_create_meeting(chat_id, group_type)
+                if not meeting or not mt:
+                    return
+                active_meetings[chat_id] = {
+                    'meeting_id':        meeting['id'],
+                    'scheduled_start':   meeting['scheduled_start'],
+                    'scheduled_end':     meeting['scheduled_end'],
+                    'grace_join_min':    mt.get('grace_join_minutes', 15),
+                    'grace_exit_min':    mt.get('grace_exit_minutes', 20),
+                    'present_threshold': mt.get('present_threshold_pct', 80),
+                    'partial_threshold': mt.get('partial_threshold_pct', 50),
+                }
+
+            cache      = active_meetings[chat_id]
+            meeting_id = cache['meeting_id']
+
+            for p in event.participants:
+                tg_uid = getattr(p.peer, 'user_id', None)
+                if not tg_uid:
+                    continue
+                event_type = 'leave' if p.left else 'join'
+                try:
+                    user = await client.get_entity(tg_uid)
+                    name = f'{user.first_name or ""} {user.last_name or ""}'.strip()
+                    fn, ln = user.first_name or '', user.last_name or ''
+                except Exception:
+                    name, fn, ln = f'User {tg_uid}', '', ''
+
+                member_id = get_or_create_member(tg_uid, name, fn, ln)
+                if not member_id:
+                    continue
+                record_voice_event(meeting_id, member_id, tg_uid, event_type)
+                calculate_attendance(meeting_id, member_id, cache)
+
+        except Exception as e:
+            log.error(f'Voice handler error: {e}', exc_info=True)
+
     log.info('Starting CAMGlobal Attendance Bot...')
     await client.start()
     log.info('Connected to Telegram.')
+
     for chat_id in GROUP_IDS:
         try:
             await client.get_entity(chat_id)
             log.info(f'Monitoring: {chat_id}')
         except Exception as e:
             log.warning(f'Cannot access {chat_id}: {e}')
+
     asyncio.create_task(check_endings())
     asyncio.create_task(check_at_risk())
     log.info('Bot running. Listening for voice chat events...')
