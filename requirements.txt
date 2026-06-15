@@ -2,3 +2,4 @@ telethon
 supabase==2.4.0
 python-dotenv
 openai
+httpx==0.25.0
