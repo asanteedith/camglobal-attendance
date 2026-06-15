@@ -31,8 +31,8 @@ GROUP_IDS = {
     -1001510684437: 'family',
 }
 
-# ── Telethon client ──────────────────────────────────────────
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# ── Telethon client (created inside main) ───────────────────
+client = None
 
 # ── Active meetings cache ────────────────────────────────────
 active_meetings: dict = {}
@@ -368,6 +368,8 @@ async def check_at_risk():
 # ════════════════════════════════════════════════════════════
 
 async def main():
+    global client
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     log.info('Starting CAMGlobal Attendance Bot...')
     await client.start()
     log.info('Connected to Telegram.')
@@ -383,7 +385,9 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    import sys
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
