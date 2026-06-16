@@ -9,6 +9,7 @@ import os
 import asyncio
 import logging
 import requests
+from aiohttp import web
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -327,6 +328,172 @@ async def check_at_risk():
         except Exception as e:
             log.error(f'At-risk check error: {e}', exc_info=True)
 
+
+# ── AI Report Generation ─────────────────────────────────────
+def generate_monthly_report():
+    import openai
+    from datetime import timedelta
+    from collections import defaultdict
+
+    openai_key = os.environ.get('OPENAI_API_KEY', '')
+    if not openai_key:
+        return None, 'OpenAI API key not configured.'
+
+    now   = now_utc()
+    start = (now - timedelta(days=30)).isoformat()
+
+    try:
+        meetings = sb_get('meetings', {
+            'scheduled_start': 'gte.' + start,
+            'status':          'eq.ended',
+            'select':          'id,title,scheduled_start,total_participants',
+            'order':           'scheduled_start.desc',
+            'limit':           '50',
+        }) or []
+
+        attendance = sb_get('attendance_records', {
+            'calculated_at': 'gte.' + start,
+            'select':        'status,attendance_pct,member_id,meeting_id,members(display_name,role)',
+            'limit':         '500',
+        }) or []
+
+        at_risk = sb_get('at_risk_members', {
+            'resolved':  'eq.false',
+            'select':    'attendance_pct_last8,consecutive_absences,members(display_name,role)',
+            'limit':     '50',
+        }) or []
+
+        corrections = sb_get('correction_requests', {
+            'created_at': 'gte.' + start,
+            'select':     'review_status,members(display_name)',
+            'limit':      '100',
+        }) or []
+
+        total_meetings  = len(meetings)
+        total_records   = len(attendance)
+        present_count   = sum(1 for r in attendance if r['status'] == 'present')
+        partial_count   = sum(1 for r in attendance if r['status'] == 'partial')
+        absent_count    = sum(1 for r in attendance if r['status'] == 'absent')
+        attendance_rate = round((present_count / total_records * 100) if total_records else 0)
+
+        member_present = defaultdict(int)
+        member_total   = defaultdict(int)
+        member_names   = {}
+        for r in attendance:
+            mid = r['member_id']
+            member_total[mid] += 1
+            if r['status'] == 'present':
+                member_present[mid] += 1
+            if r.get('members'):
+                member_names[mid] = r['members'].get('display_name', 'Unknown')
+
+        top_members = sorted(
+            [{'name': member_names.get(mid, 'Unknown'), 'present': member_present[mid], 'total': member_total[mid]}
+             for mid in member_total if member_total[mid] >= 2],
+            key=lambda x: x['present'] / x['total'],
+            reverse=True
+        )[:5]
+
+        at_risk_lines = [
+            r['members']['display_name'] + ' (' + str(r['consecutive_absences']) + ' consecutive absences, ' + str(r['attendance_pct_last8']) + '% attendance)'
+            for r in at_risk if r.get('members')
+        ]
+
+        top_lines = [
+            '- ' + m['name'] + ': ' + str(m['present']) + '/' + str(m['total']) + ' meetings attended'
+            for m in top_members
+        ] if top_members else ['- No data yet']
+
+        risk_lines = ['- ' + s for s in at_risk_lines] if at_risk_lines else ['- None flagged']
+
+        total_corrections    = len(corrections)
+        approved_corrections = sum(1 for c in corrections if c['review_status'] == 'approved')
+
+        prompt = (
+            'You are a ministry leadership assistant for Christ Ambassadors Ministries International (CAMGlobal).\n\n'
+            'Generate a concise monthly attendance report for leadership based on the following data from the past 30 days.\n\n'
+            'ATTENDANCE SUMMARY:\n'
+            '- Total meetings held: ' + str(total_meetings) + '\n'
+            '- Total attendance records: ' + str(total_records) + '\n'
+            '- Present: ' + str(present_count) + ' (' + str(attendance_rate) + '%)\n'
+            '- Partial attendance: ' + str(partial_count) + '\n'
+            '- Absent: ' + str(absent_count) + '\n\n'
+            'TOP 5 MOST CONSISTENT MEMBERS:\n' + '\n'.join(top_lines) + '\n\n'
+            'MEMBERS NEEDING FOLLOW-UP (' + str(len(at_risk_lines)) + ' at-risk):\n' + '\n'.join(risk_lines) + '\n\n'
+            'CORRECTION REQUESTS:\n'
+            '- Total submitted: ' + str(total_corrections) + '\n'
+            '- Approved: ' + str(approved_corrections) + '\n\n'
+            'Write a professional but warm leadership report covering:\n'
+            '1. Overall attendance health this month\n'
+            '2. Celebration of consistent members (mention names)\n'
+            '3. Pastoral concern for at-risk members (mention names and suggest action)\n'
+            '4. Observations and patterns you notice\n'
+            '5. Encouragement and recommendations for next month\n\n'
+            'Keep the tone encouraging, faith-based and leadership-focused. Be specific with names and numbers. Keep it under 500 words.'
+        )
+
+        client_ai = openai.OpenAI(api_key=openai_key)
+        response = client_ai.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            max_tokens=800,
+            temperature=0.7,
+        )
+        report_text = response.choices[0].message.content.strip()
+
+        period_start = (now - timedelta(days=30)).date().isoformat()
+        period_end   = now.date().isoformat()
+
+        sb_post('ai_reports', {
+            'report_type':    'monthly',
+            'period_start':   period_start,
+            'period_end':     period_end,
+            'report_content': report_text,
+            'generated_at':   now.isoformat(),
+        })
+
+        log.info('Monthly AI report generated and saved.')
+        return report_text, None
+
+    except Exception as e:
+        log.error('Report generation error: ' + str(e), exc_info=True)
+        return None, str(e)
+
+
+# ── Web server for on-demand report trigger ───────────────────
+REPORT_SECRET = os.environ.get('REPORT_SECRET', 'camglobal_report_2026')
+
+async def handle_generate_report(request):
+    try:
+        data   = await request.json()
+        secret = data.get('secret', '')
+        if secret != REPORT_SECRET:
+            return web.json_response({'success': False, 'error': 'Unauthorized'}, status=401)
+        log.info('Report generation requested via HTTP...')
+        report, error = generate_monthly_report()
+        if error:
+            return web.json_response({'success': False, 'error': error}, status=500)
+        return web.json_response({'success': True, 'report': report})
+    except Exception as e:
+        return web.json_response({'success': False, 'error': str(e)}, status=500)
+
+
+async def handle_health(request):
+    return web.json_response({'status': 'ok', 'bot': 'CAMGlobal Attendance Bot'})
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    app.router.add_post('/generate-report', handle_generate_report)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get('PORT', 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    log.info('Web server running on port ' + str(port))
+
+
 # ── Main ─────────────────────────────────────────────────────
 async def main():
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -402,6 +569,7 @@ async def main():
 
     asyncio.create_task(check_endings())
     asyncio.create_task(check_at_risk())
+    await start_web_server()
     log.info('Bot running. Listening for voice chat events...')
     await client.run_until_disconnected()
 
