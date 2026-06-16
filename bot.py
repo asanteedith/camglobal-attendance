@@ -245,6 +245,32 @@ async def check_endings():
         except Exception as e:
             log.error(f'Ending check error: {e}', exc_info=True)
 
+def create_leader_alert(member_id, alert_type, message, meeting_id=None):
+    """Write an alert to the leader_alerts table in Supabase."""
+    try:
+        # Check if same alert already exists unread in last 7 days
+        existing = sb_get('leader_alerts', {
+            'member_id':  f'eq.{member_id}',
+            'alert_type': f'eq.{alert_type}',
+            'is_read':    'eq.false',
+        })
+        if existing:
+            return  # Don't duplicate unread alerts
+        data = {
+            'member_id':  member_id,
+            'alert_type': alert_type,
+            'message':    message,
+            'is_read':    False,
+            'created_at': now_utc().isoformat(),
+        }
+        if meeting_id:
+            data['meeting_id'] = meeting_id
+        sb_post('leader_alerts', data)
+        log.info(f'Leader alert created: {alert_type} for {member_id}')
+    except Exception as e:
+        log.error(f'Failed to create leader alert: {e}')
+
+
 async def check_at_risk():
     while True:
         await asyncio.sleep(86400)
@@ -258,6 +284,7 @@ async def check_at_risk():
                 })
                 if len(recs) < 3:
                     continue
+
                 present = sum(1 for r in recs if r['status'] == 'present')
                 pct     = round((present / len(recs)) * 100)
                 consec  = 0
@@ -266,6 +293,27 @@ async def check_at_risk():
                         consec += 1
                     else:
                         break
+
+                name = m['display_name']
+
+                # Consecutive absence alerts
+                if consec == 1:
+                    create_leader_alert(
+                        m['id'], 'missed_1',
+                        f'{name} missed their last meeting. Consider checking in with them.'
+                    )
+                elif consec == 2:
+                    create_leader_alert(
+                        m['id'], 'missed_2',
+                        f'{name} has missed 2 consecutive meetings. They may need a follow-up.'
+                    )
+                elif consec >= 3:
+                    create_leader_alert(
+                        m['id'], 'at_risk',
+                        f'{name} has missed {consec} meetings in a row and their attendance is at {pct}%. Please follow up personally.'
+                    )
+
+                # At-risk flag
                 if pct < 50 or consec >= 3:
                     sb_upsert('at_risk_members', {
                         'member_id':            m['id'],
@@ -274,7 +322,8 @@ async def check_at_risk():
                         'flagged_at':           now_utc().isoformat(),
                         'resolved':             False,
                     }, on_conflict='member_id')
-                    log.info(f'At-risk: {m["display_name"]} | {pct}% | {consec} absences')
+                    log.info(f'At-risk: {name} | {pct}% | {consec} absences')
+
         except Exception as e:
             log.error(f'At-risk check error: {e}', exc_info=True)
 
