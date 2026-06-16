@@ -567,9 +567,9 @@ async def main():
         except Exception as e:
             log.warning(f'Cannot access {chat_id}: {e}')
 
+    await start_web_server()
     asyncio.create_task(check_endings())
     asyncio.create_task(check_at_risk())
-    await start_web_server()
     log.info('Bot running. Listening for voice chat events...')
     await client.run_until_disconnected()
 
