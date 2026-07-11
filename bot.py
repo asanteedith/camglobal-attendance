@@ -461,7 +461,21 @@ def generate_monthly_report():
 
 
 # ── Web server for on-demand report trigger ───────────────────
-REPORT_SECRET = os.environ.get('REPORT_SECRET', 'camglobal_report_2026')
+# SECURITY FIX: previously fell back to a hardcoded default value
+# ('camglobal_report_2026') when REPORT_SECRET wasn't set in the
+# environment. That default was sitting in plain text in this file,
+# meaning anyone with repo access could trigger /generate-report
+# (and burn OpenAI credits) if the real env var was ever missing.
+# Now it fails loudly at startup instead of silently falling back.
+REPORT_SECRET = os.environ.get('REPORT_SECRET')
+if not REPORT_SECRET:
+    raise RuntimeError(
+        'REPORT_SECRET environment variable is not set. '
+        'Set it in your Render service\'s Environment settings to a long, '
+        'random value before starting the bot — there is no default fallback '
+        'for this on purpose, since a hardcoded default would be visible to '
+        'anyone with access to this code.'
+    )
 
 async def handle_generate_report(request):
     try:
