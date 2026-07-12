@@ -425,6 +425,17 @@ def start_health_check_server():
 
 # ── Main ─────────────────────────────────────────────────────
 def main():
+    # Python 3.10+ no longer implicitly creates an event loop for the
+    # main thread (Python 3.14 enforces this strictly). PTB's internal
+    # run_polling() still calls asyncio.get_event_loop() expecting one
+    # to already exist, so we create and register it explicitly first —
+    # this makes it work regardless of which Python version is running.
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     start_health_check_server()
 
     app = Application.builder().token(BOT_TOKEN).build()
