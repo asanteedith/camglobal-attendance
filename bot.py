@@ -265,8 +265,9 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_uid    = update.effective_user.id
     member_id = get_member_id(tg_uid)
     if not member_id:
-        await update.message.reply_text(
-            "You're not linked to a CAMGlobal member account yet — ask an admin to link your Telegram to your WordPress profile."
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="You're not linked to a CAMGlobal member account yet — ask an admin to link your Telegram to your WordPress profile."
         )
         return
 
@@ -275,7 +276,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in active_meetings:
         meeting, mt = get_or_create_meeting(chat_id, group_type)
         if not meeting or not mt:
-            await update.message.reply_text("No meeting is scheduled right now for this group.")
+            await context.bot.send_message(chat_id=chat_id, text="No meeting is scheduled right now for this group.")
             return
         active_meetings[chat_id] = {
             'meeting_id':        meeting['id'],
@@ -291,7 +292,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cache = active_meetings[chat_id]
     record_event(cache['meeting_id'], member_id, tg_uid, 'checkin')
-    await update.message.reply_text(f"✅ {update.effective_user.first_name}, you're checked in!")
+    await context.bot.send_message(chat_id=chat_id, text=f"✅ {update.effective_user.first_name}, you're checked in!")
 
 async def rollcall_button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
@@ -442,6 +443,11 @@ def main():
 
     app.add_handler(CommandHandler('checkin', cmd_checkin))
     app.add_handler(CallbackQueryHandler(rollcall_button_tap, pattern=r'^rollcall:\d+$'))
+
+    async def on_error(update, context):
+        log.error(f'Unhandled exception: {context.error}', exc_info=context.error)
+
+    app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(post_rollcalls, interval=60, first=10)
     app.job_queue.run_repeating(check_at_risk, interval=86400, first=30)
