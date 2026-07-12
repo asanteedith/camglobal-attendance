@@ -414,7 +414,7 @@ async def check_at_risk(context: ContextTypes.DEFAULT_TYPE):
 # bot's own polling loop.
 def start_health_check_server():
     import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -423,11 +423,23 @@ def start_health_check_server():
             self.end_headers()
             self.wfile.write(b'{"status": "ok", "bot": "CAMGlobal Attendance Bot"}')
 
+        def do_HEAD(self):
+            # Some monitoring tools (and Render's own proxy) use HEAD
+            # requests to check liveness without downloading a body.
+            # Without this, those requests were rejected outright,
+            # which could surface upstream as a 502.
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+
         def log_message(self, format, *args):
             pass  # suppress default request logging, keep our own logs clean
 
     port = int(os.environ.get('PORT', 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    # ThreadingHTTPServer (not the plain single-threaded HTTPServer) so
+    # an overlapping health check from Render and a monitoring service
+    # like UptimeRobot can't block each other.
+    server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     log.info(f'Health check server running on port {port}')
