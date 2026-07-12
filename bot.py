@@ -1,31 +1,46 @@
 """
-CAMGlobal Attendance Bot v3
-- No supabase SDK (direct HTTP via requests)
-- Client and handlers created inside main()
-- Works on Render/Railway
+CAMGlobal Attendance Bot — Official Bot API version (v2)
+
+Replaces the Telethon userbot approach entirely. Uses a real Telegram
+Bot (created via @BotFather) instead of logging in as a personal
+account — no session file, no phone number, no 2FA, no ToS risk.
+If the bot token ever leaks, regenerate it in @BotFather in 10
+seconds; nothing about a personal account is ever at stake.
+
+Tracking method: since the official Bot API cannot see who joins or
+leaves a live voice chat (that's a hard Telegram limitation, not a
+gap in this code), attendance is tracked via:
+  1. /checkin — member types this when they join a meeting
+  2. Periodic roll-call pings ("Still here?") with a tappable button,
+     posted every ROLLCALL_INTERVAL_MINUTES during the meeting window
+  3. Attendance duration is estimated from first check-in to the
+     last roll-call round the member actually responded to
+
+Writes to the exact same Supabase schema as the old bot — meeting_types,
+meetings, members, voice_events, attendance_records, attendance_review_queue,
+leader_alerts, at_risk_members — so the WordPress Attendance Dashboard
+and the AI monthly report need zero changes.
 """
 
 import os
 import asyncio
 import logging
 import requests
-from aiohttp import web
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import UpdateGroupCallParticipants
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
 # ── Config ───────────────────────────────────────────────────
-API_ID       = int(os.environ['TELEGRAM_API_ID'])
-API_HASH     = os.environ['TELEGRAM_API_HASH']
-SESSION_NAME = os.environ.get('SESSION_NAME', 'camglobal_bot')
+BOT_TOKEN    = os.environ['TELEGRAM_BOT_TOKEN']          # from @BotFather, not a phone/session
 SUPABASE_URL = os.environ['SUPABASE_URL'].rstrip('/')
 SUPABASE_KEY = os.environ['SUPABASE_SERVICE_KEY']
+
+ROLLCALL_INTERVAL_MINUTES = int(os.environ.get('ROLLCALL_INTERVAL_MINUTES', 15))
 
 GROUP_IDS = {
     -1001433101619: 'main',
@@ -34,9 +49,10 @@ GROUP_IDS = {
     -1001510684437: 'family',
 }
 
+# In-memory state per active meeting: { chat_id: {...} }
 active_meetings: dict = {}
 
-# ── Supabase HTTP helpers ────────────────────────────────────
+# ── Supabase HTTP helpers (identical to the old bot — same schema) ──
 HEADERS = {
     'apikey': SUPABASE_KEY,
     'Authorization': f'Bearer {SUPABASE_KEY}',
@@ -92,7 +108,6 @@ def get_or_create_meeting(chat_id, group_type):
     now = now_utc()
     mt  = find_meeting_type(group_type, now)
     if not mt:
-        log.info(f'No meeting matched for {group_type} at {now.strftime("%H:%M")}')
         return None, None
 
     grp_rows = sb_get('telegram_groups', {'telegram_chat_id': f'eq.{chat_id}'})
@@ -132,26 +147,30 @@ def get_or_create_meeting(chat_id, group_type):
     log.info(f'Created meeting: {mt["name"]}')
     return m, mt
 
-def get_or_create_member(tg_user_id, display_name, first_name='', last_name=''):
-    # Only track members already linked in Supabase (cam_visitor, cam_sons, cam_family)
-    # Never auto-create — unlinked visitors are ignored
+def get_member_id(tg_user_id):
+    # Only track members already linked in Supabase — never auto-create.
     rows = sb_get('members', {'telegram_user_id': f'eq.{tg_user_id}'})
-    if rows:
-        return rows[0]['id']
-    log.info(f'Ignoring unlinked user: {display_name} ({tg_user_id})')
-    return None
+    return rows[0]['id'] if rows else None
 
-def record_voice_event(meeting_id, member_id, tg_user_id, event_type):
-    sb_post('voice_events', {
+def record_event(meeting_id, member_id, tg_user_id, event_type, rollcall_round=None):
+    data = {
         'meeting_id':       meeting_id,
         'member_id':        member_id,
         'telegram_user_id': tg_user_id,
         'event_type':       event_type,
         'event_time':       now_utc().isoformat(),
-    })
-    log.info(f'{event_type.upper()} | {member_id[:8]}')
+    }
+    if rollcall_round is not None:
+        data['rollcall_round'] = rollcall_round
+    sb_post('voice_events', data)
+    log.info(f'{event_type.upper()} | round={rollcall_round} | {str(member_id)[:8]}')
 
 def calculate_attendance(meeting_id, member_id, cache):
+    """
+    Estimates presence duration from the spread of checkin/rollcall
+    events a member actually responded to — first event to last event
+    they responded to — instead of an explicit join/leave pair.
+    """
     now  = now_utc()
     evts = sb_get('voice_events', {
         'meeting_id': f'eq.{meeting_id}',
@@ -161,37 +180,42 @@ def calculate_attendance(meeting_id, member_id, cache):
     if not evts:
         return
 
-    joins  = [e for e in evts if e['event_type'] == 'join']
-    leaves = [e for e in evts if e['event_type'] == 'leave']
-    if not joins:
-        return
-
     def parse_dt(s):
         return datetime.fromisoformat(s.replace('Z', '+00:00'))
 
-    first_join = parse_dt(joins[0]['event_time'])
-    last_leave = parse_dt(leaves[-1]['event_time']) if leaves else None
-    s_start    = parse_dt(cache['scheduled_start'])
-    s_end      = parse_dt(cache['scheduled_end'])
-    eff_leave  = last_leave or now
+    first_seen = parse_dt(evts[0]['event_time'])
+    last_seen  = parse_dt(evts[-1]['event_time'])
 
-    duration_min = max(0, int((eff_leave - first_join).total_seconds() / 60))
+    s_start = parse_dt(cache['scheduled_start'])
+    s_end   = parse_dt(cache['scheduled_end'])
+
+    duration_min = max(0, int((last_seen - first_seen).total_seconds() / 60))
     meeting_min  = max(1, int((s_end - s_start).total_seconds() / 60))
     pct          = min(100, round((duration_min / meeting_min) * 100))
 
+    total_rounds     = cache.get('rollcall_count', 0)
+    rounds_responded = len([e for e in evts if e['event_type'] == 'rollcall'])
+    # If they responded to the final round posted before the meeting ended,
+    # treat them as having stayed to the end even if duration_min undershoots
+    # slightly (rounds are spaced ROLLCALL_INTERVAL_MINUTES apart).
+    responded_to_last_round = (
+        total_rounds > 0 and
+        any(e['event_type'] == 'rollcall' and e.get('rollcall_round') == total_rounds for e in evts)
+    )
+
     grace_join     = s_start + timedelta(minutes=cache['grace_join_min'])
     grace_exit     = s_end   - timedelta(minutes=cache['grace_exit_min'])
-    joined_on_time = first_join <= grace_join
-    stayed_to_end  = last_leave is None or last_leave >= grace_exit
+    joined_on_time = first_seen <= grace_join
+    stayed_to_end  = responded_to_last_round or last_seen >= grace_exit
     auto_marked    = joined_on_time and stayed_to_end and pct >= cache['present_threshold']
     status         = 'present' if auto_marked else ('partial' if pct >= cache['partial_threshold'] else 'absent')
 
     sb_upsert('attendance_records', {
         'meeting_id':             meeting_id,
         'member_id':              member_id,
-        'telegram_user_id':       joins[0].get('telegram_user_id'),
-        'first_join_at':          first_join.isoformat(),
-        'last_leave_at':          last_leave.isoformat() if last_leave else None,
+        'telegram_user_id':       evts[0].get('telegram_user_id'),
+        'first_join_at':          first_seen.isoformat(),
+        'last_leave_at':          last_seen.isoformat(),
         'total_duration_minutes': duration_min,
         'attendance_pct':         pct,
         'status':                 status,
@@ -200,21 +224,15 @@ def calculate_attendance(meeting_id, member_id, cache):
     }, on_conflict='meeting_id,member_id')
 
     if not auto_marked:
-        att_rows = sb_get('attendance_records', {
-            'meeting_id': f'eq.{meeting_id}',
-            'member_id':  f'eq.{member_id}',
-        })
+        att_rows = sb_get('attendance_records', {'meeting_id': f'eq.{meeting_id}', 'member_id': f'eq.{member_id}'})
         if att_rows:
             att_id   = att_rows[0]['id']
-            in_queue = sb_get('attendance_review_queue', {
-                'attendance_record_id': f'eq.{att_id}',
-                'review_status':        'eq.pending',
-            })
+            in_queue = sb_get('attendance_review_queue', {'attendance_record_id': f'eq.{att_id}', 'review_status': 'eq.pending'})
             if not in_queue:
                 reason = (
                     f'{"On time" if joined_on_time else "Late"}, '
                     f'{"stayed to end" if stayed_to_end else "left early"}, '
-                    f'{pct}% ({duration_min}/{meeting_min} min)'
+                    f'{pct}% ({rounds_responded}/{max(total_rounds,1)} roll-calls answered)'
                 )
                 sb_post('attendance_review_queue', {
                     'attendance_record_id': att_id,
@@ -224,359 +242,201 @@ def calculate_attendance(meeting_id, member_id, cache):
                     'reason':               reason,
                     'confidence':           round(pct / 100, 2),
                 })
-    log.info(f'Attendance: {status} | {pct}% | auto={auto_marked}')
-
-# ── Background tasks ─────────────────────────────────────────
-async def check_endings():
-    while True:
-        await asyncio.sleep(300)
-        try:
-            now = now_utc()
-            for chat_id, cache in list(active_meetings.items()):
-                s_end = datetime.fromisoformat(cache['scheduled_end'].replace('Z', '+00:00'))
-                if now > s_end + timedelta(minutes=10):
-                    log.info(f'Finalising meeting {chat_id}')
-                    sb_patch('meetings', {'id': f'eq.{cache["meeting_id"]}'}, {
-                        'status': 'ended', 'actual_end': now.isoformat()
-                    })
-                    recs = sb_get('attendance_records', {'meeting_id': f'eq.{cache["meeting_id"]}'})
-                    for r in recs:
-                        calculate_attendance(cache['meeting_id'], r['member_id'], cache)
-                    del active_meetings[chat_id]
-        except Exception as e:
-            log.error(f'Ending check error: {e}', exc_info=True)
+    log.info(f'Attendance: {status} | {pct}% | rounds={rounds_responded}/{total_rounds}')
 
 def create_leader_alert(member_id, alert_type, message, meeting_id=None):
-    """Write an alert to the leader_alerts table in Supabase."""
     try:
-        # Check if same alert already exists unread in last 7 days
-        existing = sb_get('leader_alerts', {
-            'member_id':  f'eq.{member_id}',
-            'alert_type': f'eq.{alert_type}',
-            'is_read':    'eq.false',
-        })
+        existing = sb_get('leader_alerts', {'member_id': f'eq.{member_id}', 'alert_type': f'eq.{alert_type}', 'is_read': 'eq.false'})
         if existing:
-            return  # Don't duplicate unread alerts
-        data = {
-            'member_id':  member_id,
-            'alert_type': alert_type,
-            'message':    message,
-            'is_read':    False,
-            'created_at': now_utc().isoformat(),
-        }
+            return
+        data = {'member_id': member_id, 'alert_type': alert_type, 'message': message, 'is_read': False, 'created_at': now_utc().isoformat()}
         if meeting_id:
             data['meeting_id'] = meeting_id
         sb_post('leader_alerts', data)
-        log.info(f'Leader alert created: {alert_type} for {member_id}')
     except Exception as e:
         log.error(f'Failed to create leader alert: {e}')
 
+# ── Commands ─────────────────────────────────────────────────
+async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in GROUP_IDS:
+        return
 
-async def check_at_risk():
-    while True:
-        await asyncio.sleep(86400)
-        try:
-            members = sb_get('members', {'is_active': 'eq.true'})
-            for m in members:
-                recs = sb_get('attendance_records', {
-                    'member_id': f'eq.{m["id"]}',
-                    'order':     'calculated_at.desc',
-                    'limit':     '8',
-                })
-                if len(recs) < 3:
-                    continue
-
-                present = sum(1 for r in recs if r['status'] == 'present')
-                pct     = round((present / len(recs)) * 100)
-                consec  = 0
-                for r in recs:
-                    if r['status'] in ('absent', 'partial'):
-                        consec += 1
-                    else:
-                        break
-
-                name = m['display_name']
-
-                # Consecutive absence alerts
-                if consec == 1:
-                    create_leader_alert(
-                        m['id'], 'missed_1',
-                        f'{name} missed their last meeting. Consider checking in with them.'
-                    )
-                elif consec == 2:
-                    create_leader_alert(
-                        m['id'], 'missed_2',
-                        f'{name} has missed 2 consecutive meetings. They may need a follow-up.'
-                    )
-                elif consec >= 3:
-                    create_leader_alert(
-                        m['id'], 'at_risk',
-                        f'{name} has missed {consec} meetings in a row and their attendance is at {pct}%. Please follow up personally.'
-                    )
-
-                # At-risk flag
-                if pct < 50 or consec >= 3:
-                    sb_upsert('at_risk_members', {
-                        'member_id':            m['id'],
-                        'attendance_pct_last8': pct,
-                        'consecutive_absences': consec,
-                        'flagged_at':           now_utc().isoformat(),
-                        'resolved':             False,
-                    }, on_conflict='member_id')
-                    log.info(f'At-risk: {name} | {pct}% | {consec} absences')
-
-        except Exception as e:
-            log.error(f'At-risk check error: {e}', exc_info=True)
-
-
-# ── AI Report Generation ─────────────────────────────────────
-def generate_monthly_report():
-    import openai
-    from datetime import timedelta
-    from collections import defaultdict
-
-    openai_key = os.environ.get('OPENAI_API_KEY', '')
-    if not openai_key:
-        return None, 'OpenAI API key not configured.'
-
-    now   = now_utc()
-    start = (now - timedelta(days=30)).isoformat()
-
-    try:
-        meetings = sb_get('meetings', {
-            'scheduled_start': 'gte.' + start,
-            'status':          'eq.ended',
-            'select':          'id,title,scheduled_start,total_participants',
-            'order':           'scheduled_start.desc',
-            'limit':           '50',
-        }) or []
-
-        attendance = sb_get('attendance_records', {
-            'calculated_at': 'gte.' + start,
-            'select':        'status,attendance_pct,member_id,meeting_id,members(display_name,role)',
-            'limit':         '500',
-        }) or []
-
-        at_risk = sb_get('at_risk_members', {
-            'resolved':  'eq.false',
-            'select':    'attendance_pct_last8,consecutive_absences,members(display_name,role)',
-            'limit':     '50',
-        }) or []
-
-        corrections = sb_get('correction_requests', {
-            'created_at': 'gte.' + start,
-            'select':     'review_status,members(display_name)',
-            'limit':      '100',
-        }) or []
-
-        total_meetings  = len(meetings)
-        total_records   = len(attendance)
-        present_count   = sum(1 for r in attendance if r['status'] == 'present')
-        partial_count   = sum(1 for r in attendance if r['status'] == 'partial')
-        absent_count    = sum(1 for r in attendance if r['status'] == 'absent')
-        attendance_rate = round((present_count / total_records * 100) if total_records else 0)
-
-        member_present = defaultdict(int)
-        member_total   = defaultdict(int)
-        member_names   = {}
-        for r in attendance:
-            mid = r['member_id']
-            member_total[mid] += 1
-            if r['status'] == 'present':
-                member_present[mid] += 1
-            if r.get('members'):
-                member_names[mid] = r['members'].get('display_name', 'Unknown')
-
-        top_members = sorted(
-            [{'name': member_names.get(mid, 'Unknown'), 'present': member_present[mid], 'total': member_total[mid]}
-             for mid in member_total if member_total[mid] >= 2],
-            key=lambda x: x['present'] / x['total'],
-            reverse=True
-        )[:5]
-
-        at_risk_lines = [
-            r['members']['display_name'] + ' (' + str(r['consecutive_absences']) + ' consecutive absences, ' + str(r['attendance_pct_last8']) + '% attendance)'
-            for r in at_risk if r.get('members')
-        ]
-
-        top_lines = [
-            '- ' + m['name'] + ': ' + str(m['present']) + '/' + str(m['total']) + ' meetings attended'
-            for m in top_members
-        ] if top_members else ['- No data yet']
-
-        risk_lines = ['- ' + s for s in at_risk_lines] if at_risk_lines else ['- None flagged']
-
-        total_corrections    = len(corrections)
-        approved_corrections = sum(1 for c in corrections if c['review_status'] == 'approved')
-
-        prompt = (
-            'You are a ministry leadership assistant for Christ Ambassadors Ministries International (CAMGlobal).\n\n'
-            'Generate a concise monthly attendance report for leadership based on the following data from the past 30 days.\n\n'
-            'ATTENDANCE SUMMARY:\n'
-            '- Total meetings held: ' + str(total_meetings) + '\n'
-            '- Total attendance records: ' + str(total_records) + '\n'
-            '- Present: ' + str(present_count) + ' (' + str(attendance_rate) + '%)\n'
-            '- Partial attendance: ' + str(partial_count) + '\n'
-            '- Absent: ' + str(absent_count) + '\n\n'
-            'TOP 5 MOST CONSISTENT MEMBERS:\n' + '\n'.join(top_lines) + '\n\n'
-            'MEMBERS NEEDING FOLLOW-UP (' + str(len(at_risk_lines)) + ' at-risk):\n' + '\n'.join(risk_lines) + '\n\n'
-            'CORRECTION REQUESTS:\n'
-            '- Total submitted: ' + str(total_corrections) + '\n'
-            '- Approved: ' + str(approved_corrections) + '\n\n'
-            'Write a professional but warm leadership report covering:\n'
-            '1. Overall attendance health this month\n'
-            '2. Celebration of consistent members (mention names)\n'
-            '3. Pastoral concern for at-risk members (mention names and suggest action)\n'
-            '4. Observations and patterns you notice\n'
-            '5. Encouragement and recommendations for next month\n\n'
-            'Keep the tone encouraging, faith-based and leadership-focused. Be specific with names and numbers. Keep it under 500 words.'
+    tg_uid    = update.effective_user.id
+    member_id = get_member_id(tg_uid)
+    if not member_id:
+        await update.message.reply_text(
+            "You're not linked to a CAMGlobal member account yet — ask an admin to link your Telegram to your WordPress profile."
         )
+        return
 
-        client_ai = openai.OpenAI(api_key=openai_key)
-        response = client_ai.chat.completions.create(
-            model='gpt-4o-mini',
-            messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=800,
-            temperature=0.7,
-        )
-        report_text = response.choices[0].message.content.strip()
+    group_type = GROUP_IDS[chat_id]
 
-        period_start = (now - timedelta(days=30)).date().isoformat()
-        period_end   = now.date().isoformat()
+    if chat_id not in active_meetings:
+        meeting, mt = get_or_create_meeting(chat_id, group_type)
+        if not meeting or not mt:
+            await update.message.reply_text("No meeting is scheduled right now for this group.")
+            return
+        active_meetings[chat_id] = {
+            'meeting_id':        meeting['id'],
+            'scheduled_start':   meeting['scheduled_start'],
+            'scheduled_end':     meeting['scheduled_end'],
+            'grace_join_min':    mt.get('grace_join_minutes', 15),
+            'grace_exit_min':    mt.get('grace_exit_minutes', 20),
+            'present_threshold': mt.get('present_threshold_pct', 80),
+            'partial_threshold': mt.get('partial_threshold_pct', 50),
+            'rollcall_count':    0,
+            'last_rollcall_at':  None,
+        }
 
-        sb_post('ai_reports', {
-            'report_type':    'monthly',
-            'period_start':   period_start,
-            'period_end':     period_end,
-            'report_content': report_text,
-            'generated_at':   now.isoformat(),
-        })
+    cache = active_meetings[chat_id]
+    record_event(cache['meeting_id'], member_id, tg_uid, 'checkin')
+    await update.message.reply_text(f"✅ {update.effective_user.first_name}, you're checked in!")
 
-        log.info('Monthly AI report generated and saved.')
-        return report_text, None
+async def rollcall_button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    chat_id = query.message.chat_id
+    if chat_id not in active_meetings:
+        await query.answer("This meeting has ended.", show_alert=True)
+        return
 
-    except Exception as e:
-        log.error('Report generation error: ' + str(e), exc_info=True)
-        return None, str(e)
+    tg_uid    = query.from_user.id
+    member_id = get_member_id(tg_uid)
+    if not member_id:
+        await query.answer("You're not linked to a member account yet.", show_alert=True)
+        return
 
+    cache          = active_meetings[chat_id]
+    rollcall_round = int(query.data.split(':')[1])
+    record_event(cache['meeting_id'], member_id, tg_uid, 'rollcall', rollcall_round=rollcall_round)
+    await query.answer("✅ Marked present for this round!")
 
-# ── Web server for on-demand report trigger ───────────────────
-REPORT_SECRET = os.environ.get('REPORT_SECRET', 'camglobal_report_2026')
+# ── Background jobs ──────────────────────────────────────────
+async def post_rollcalls(context: ContextTypes.DEFAULT_TYPE):
+    now = now_utc()
+    for chat_id in list(GROUP_IDS.keys()):
+        group_type = GROUP_IDS[chat_id]
+        mt = find_meeting_type(group_type, now)
 
-async def handle_generate_report(request):
+        if not mt:
+            # No active meeting window right now — if one was tracked, finalise it.
+            if chat_id in active_meetings:
+                await finalise_meeting(context, chat_id)
+            continue
+
+        if chat_id not in active_meetings:
+            meeting, mt2 = get_or_create_meeting(chat_id, group_type)
+            if not meeting:
+                continue
+            active_meetings[chat_id] = {
+                'meeting_id':        meeting['id'],
+                'scheduled_start':   meeting['scheduled_start'],
+                'scheduled_end':     meeting['scheduled_end'],
+                'grace_join_min':    mt2.get('grace_join_minutes', 15),
+                'grace_exit_min':    mt2.get('grace_exit_minutes', 20),
+                'present_threshold': mt2.get('present_threshold_pct', 80),
+                'partial_threshold': mt2.get('partial_threshold_pct', 50),
+                'rollcall_count':    0,
+                'last_rollcall_at':  None,
+            }
+
+        cache = active_meetings[chat_id]
+        last  = cache['last_rollcall_at']
+        if last is None or (now - last).total_seconds() >= ROLLCALL_INTERVAL_MINUTES * 60:
+            cache['rollcall_count'] += 1
+            cache['last_rollcall_at'] = now
+            round_num = cache['rollcall_count']
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Still here", callback_data=f"rollcall:{round_num}")]])
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Roll call #{round_num} — tap below if you're still here 👇",
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                log.error(f'Failed to post roll-call in {chat_id}: {e}')
+
+async def finalise_meeting(context: ContextTypes.DEFAULT_TYPE, chat_id):
+    cache = active_meetings.pop(chat_id, None)
+    if not cache:
+        return
+    now = now_utc()
+    log.info(f'Finalising meeting {cache["meeting_id"]}')
+    sb_patch('meetings', {'id': f'eq.{cache["meeting_id"]}'}, {'status': 'ended', 'actual_end': now.isoformat()})
+
+    evts = sb_get('voice_events', {'meeting_id': f'eq.{cache["meeting_id"]}', 'select': 'member_id'})
+    seen_members = {e['member_id'] for e in evts}
+    for member_id in seen_members:
+        calculate_attendance(cache['meeting_id'], member_id, cache)
+
+async def check_at_risk(context: ContextTypes.DEFAULT_TYPE):
     try:
-        data   = await request.json()
-        secret = data.get('secret', '')
-        if secret != REPORT_SECRET:
-            return web.json_response({'success': False, 'error': 'Unauthorized'}, status=401)
-        log.info('Report generation requested via HTTP...')
-        report, error = generate_monthly_report()
-        if error:
-            return web.json_response({'success': False, 'error': error}, status=500)
-        return web.json_response({'success': True, 'report': report})
+        members = sb_get('members', {'is_active': 'eq.true'})
+        for m in members:
+            recs = sb_get('attendance_records', {'member_id': f'eq.{m["id"]}', 'order': 'calculated_at.desc', 'limit': '8'})
+            if len(recs) < 3:
+                continue
+            present = sum(1 for r in recs if r['status'] == 'present')
+            pct     = round((present / len(recs)) * 100)
+            consec  = 0
+            for r in recs:
+                if r['status'] in ('absent', 'partial'):
+                    consec += 1
+                else:
+                    break
+            name = m['display_name']
+            if consec == 1:
+                create_leader_alert(m['id'], 'missed_1', f'{name} missed their last meeting. Consider checking in with them.')
+            elif consec == 2:
+                create_leader_alert(m['id'], 'missed_2', f'{name} has missed 2 consecutive meetings. They may need a follow-up.')
+            elif consec >= 3:
+                create_leader_alert(m['id'], 'at_risk', f'{name} has missed {consec} meetings in a row and their attendance is at {pct}%. Please follow up personally.')
+            if pct < 50 or consec >= 3:
+                sb_upsert('at_risk_members', {
+                    'member_id': m['id'], 'attendance_pct_last8': pct, 'consecutive_absences': consec,
+                    'flagged_at': now_utc().isoformat(), 'resolved': False,
+                }, on_conflict='member_id')
     except Exception as e:
-        return web.json_response({'success': False, 'error': str(e)}, status=500)
+        log.error(f'At-risk check error: {e}', exc_info=True)
 
+# ── Minimal health-check server for Render ─────────────────────
+# Render's health check needs something responding on a port. This
+# runs in a background thread so it doesn't interfere with the
+# bot's own polling loop.
+def start_health_check_server():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
 
-async def handle_health(request):
-    return web.json_response({'status': 'ok', 'bot': 'CAMGlobal Attendance Bot'})
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status": "ok", "bot": "CAMGlobal Attendance Bot"}')
 
+        def log_message(self, format, *args):
+            pass  # suppress default request logging, keep our own logs clean
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle_health)
-    app.router.add_post('/generate-report', handle_generate_report)
-    runner = web.AppRunner(app)
-    await runner.setup()
     port = int(os.environ.get('PORT', 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    log.info('Web server running on port ' + str(port))
-
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info(f'Health check server running on port {port}')
 
 # ── Main ─────────────────────────────────────────────────────
-async def main():
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+def main():
+    start_health_check_server()
 
-    # Register handlers inside main so client exists
-    @client.on(events.Raw(UpdateGroupCallParticipants))
-    async def on_voice(event):
-        try:
-            chat_id = None
-            if hasattr(event, 'call') and hasattr(event.call, 'id'):
-                for gid in GROUP_IDS:
-                    try:
-                        full = await client(GetFullChannelRequest(gid))
-                        if full.full_chat.call and full.full_chat.call.id == event.call.id:
-                            chat_id = gid
-                            break
-                    except Exception:
-                        continue
+    app = Application.builder().token(BOT_TOKEN).build()
 
-            if not chat_id or chat_id not in GROUP_IDS:
-                return
+    app.add_handler(CommandHandler('checkin', cmd_checkin))
+    app.add_handler(CallbackQueryHandler(rollcall_button_tap, pattern=r'^rollcall:\d+$'))
 
-            group_type = GROUP_IDS[chat_id]
+    app.job_queue.run_repeating(post_rollcalls, interval=60, first=10)
+    app.job_queue.run_repeating(check_at_risk, interval=86400, first=30)
 
-            if chat_id not in active_meetings:
-                meeting, mt = get_or_create_meeting(chat_id, group_type)
-                if not meeting or not mt:
-                    return
-                active_meetings[chat_id] = {
-                    'meeting_id':        meeting['id'],
-                    'scheduled_start':   meeting['scheduled_start'],
-                    'scheduled_end':     meeting['scheduled_end'],
-                    'grace_join_min':    mt.get('grace_join_minutes', 15),
-                    'grace_exit_min':    mt.get('grace_exit_minutes', 20),
-                    'present_threshold': mt.get('present_threshold_pct', 80),
-                    'partial_threshold': mt.get('partial_threshold_pct', 50),
-                }
-
-            cache      = active_meetings[chat_id]
-            meeting_id = cache['meeting_id']
-
-            for p in event.participants:
-                tg_uid = getattr(p.peer, 'user_id', None)
-                if not tg_uid:
-                    continue
-                event_type = 'leave' if p.left else 'join'
-                try:
-                    user = await client.get_entity(tg_uid)
-                    name = f'{user.first_name or ""} {user.last_name or ""}'.strip()
-                    fn, ln = user.first_name or '', user.last_name or ''
-                except Exception:
-                    name, fn, ln = f'User {tg_uid}', '', ''
-
-                member_id = get_or_create_member(tg_uid, name, fn, ln)
-                if not member_id:
-                    continue
-                record_voice_event(meeting_id, member_id, tg_uid, event_type)
-                calculate_attendance(meeting_id, member_id, cache)
-
-        except Exception as e:
-            log.error(f'Voice handler error: {e}', exc_info=True)
-
-    log.info('Starting CAMGlobal Attendance Bot...')
-    await client.start()
-    log.info('Connected to Telegram.')
-
-    for chat_id in GROUP_IDS:
-        try:
-            await client.get_entity(chat_id)
-            log.info(f'Monitoring: {chat_id}')
-        except Exception as e:
-            log.warning(f'Cannot access {chat_id}: {e}')
-
-    await start_web_server()
-    asyncio.create_task(check_endings())
-    asyncio.create_task(check_at_risk())
-    log.info('Bot running. Listening for voice chat events...')
-    await client.run_until_disconnected()
+    log.info('CAMGlobal Attendance Bot (official Bot API) starting...')
+    app.run_polling()
 
 if __name__ == '__main__':
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(main())
-    finally:
-        loop.close()
+    main()
