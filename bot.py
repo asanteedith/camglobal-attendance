@@ -260,10 +260,18 @@ def create_leader_alert(member_id, alert_type, message, meeting_id=None):
 async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in GROUP_IDS:
+        # Logged so a mismatched/changed group ID can be identified and
+        # added to GROUP_IDS — without this, an unrecognized group is
+        # silently ignored with zero trace in the logs.
+        log.warning(
+            f'Received /checkin from an unrecognized chat_id={chat_id} '
+            f'(chat title: "{update.effective_chat.title}"). '
+            f'This chat is not in GROUP_IDS — add it if this should be tracked.'
+        )
         return
 
     tg_uid    = update.effective_user.id
-    member_id = get_member_id(tg_uid)
+    member_id = await asyncio.to_thread(get_member_id, tg_uid)
     if not member_id:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -274,7 +282,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_type = GROUP_IDS[chat_id]
 
     if chat_id not in active_meetings:
-        meeting, mt = get_or_create_meeting(chat_id, group_type)
+        meeting, mt = await asyncio.to_thread(get_or_create_meeting, chat_id, group_type)
         if not meeting or not mt:
             await context.bot.send_message(chat_id=chat_id, text="No meeting is scheduled right now for this group.")
             return
@@ -291,7 +299,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
     cache = active_meetings[chat_id]
-    record_event(cache['meeting_id'], member_id, tg_uid, 'checkin')
+    await asyncio.to_thread(record_event, cache['meeting_id'], member_id, tg_uid, 'checkin')
     await context.bot.send_message(chat_id=chat_id, text=f"✅ {update.effective_user.first_name}, you're checked in!")
 
 async def rollcall_button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,14 +310,14 @@ async def rollcall_button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     tg_uid    = query.from_user.id
-    member_id = get_member_id(tg_uid)
+    member_id = await asyncio.to_thread(get_member_id, tg_uid)
     if not member_id:
         await query.answer("You're not linked to a member account yet.", show_alert=True)
         return
 
     cache          = active_meetings[chat_id]
     rollcall_round = int(query.data.split(':')[1])
-    record_event(cache['meeting_id'], member_id, tg_uid, 'rollcall', rollcall_round=rollcall_round)
+    await asyncio.to_thread(record_event, cache['meeting_id'], member_id, tg_uid, 'rollcall', rollcall_round=rollcall_round)
     await query.answer("✅ Marked present for this round!")
 
 # ── Background jobs ──────────────────────────────────────────
@@ -317,7 +325,7 @@ async def post_rollcalls(context: ContextTypes.DEFAULT_TYPE):
     now = now_utc()
     for chat_id in list(GROUP_IDS.keys()):
         group_type = GROUP_IDS[chat_id]
-        mt = find_meeting_type(group_type, now)
+        mt = await asyncio.to_thread(find_meeting_type, group_type, now)
 
         if not mt:
             # No active meeting window right now — if one was tracked, finalise it.
@@ -326,7 +334,7 @@ async def post_rollcalls(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         if chat_id not in active_meetings:
-            meeting, mt2 = get_or_create_meeting(chat_id, group_type)
+            meeting, mt2 = await asyncio.to_thread(get_or_create_meeting, chat_id, group_type)
             if not meeting:
                 continue
             active_meetings[chat_id] = {
@@ -363,18 +371,18 @@ async def finalise_meeting(context: ContextTypes.DEFAULT_TYPE, chat_id):
         return
     now = now_utc()
     log.info(f'Finalising meeting {cache["meeting_id"]}')
-    sb_patch('meetings', {'id': f'eq.{cache["meeting_id"]}'}, {'status': 'ended', 'actual_end': now.isoformat()})
+    await asyncio.to_thread(sb_patch, 'meetings', {'id': f'eq.{cache["meeting_id"]}'}, {'status': 'ended', 'actual_end': now.isoformat()})
 
-    evts = sb_get('voice_events', {'meeting_id': f'eq.{cache["meeting_id"]}', 'select': 'member_id'})
+    evts = await asyncio.to_thread(sb_get, 'voice_events', {'meeting_id': f'eq.{cache["meeting_id"]}', 'select': 'member_id'})
     seen_members = {e['member_id'] for e in evts}
     for member_id in seen_members:
-        calculate_attendance(cache['meeting_id'], member_id, cache)
+        await asyncio.to_thread(calculate_attendance, cache['meeting_id'], member_id, cache)
 
 async def check_at_risk(context: ContextTypes.DEFAULT_TYPE):
     try:
-        members = sb_get('members', {'is_active': 'eq.true'})
+        members = await asyncio.to_thread(sb_get, 'members', {'is_active': 'eq.true'})
         for m in members:
-            recs = sb_get('attendance_records', {'member_id': f'eq.{m["id"]}', 'order': 'calculated_at.desc', 'limit': '8'})
+            recs = await asyncio.to_thread(sb_get, 'attendance_records', {'member_id': f'eq.{m["id"]}', 'order': 'calculated_at.desc', 'limit': '8'})
             if len(recs) < 3:
                 continue
             present = sum(1 for r in recs if r['status'] == 'present')
@@ -387,13 +395,13 @@ async def check_at_risk(context: ContextTypes.DEFAULT_TYPE):
                     break
             name = m['display_name']
             if consec == 1:
-                create_leader_alert(m['id'], 'missed_1', f'{name} missed their last meeting. Consider checking in with them.')
+                await asyncio.to_thread(create_leader_alert, m['id'], 'missed_1', f'{name} missed their last meeting. Consider checking in with them.')
             elif consec == 2:
-                create_leader_alert(m['id'], 'missed_2', f'{name} has missed 2 consecutive meetings. They may need a follow-up.')
+                await asyncio.to_thread(create_leader_alert, m['id'], 'missed_2', f'{name} has missed 2 consecutive meetings. They may need a follow-up.')
             elif consec >= 3:
-                create_leader_alert(m['id'], 'at_risk', f'{name} has missed {consec} meetings in a row and their attendance is at {pct}%. Please follow up personally.')
+                await asyncio.to_thread(create_leader_alert, m['id'], 'at_risk', f'{name} has missed {consec} meetings in a row and their attendance is at {pct}%. Please follow up personally.')
             if pct < 50 or consec >= 3:
-                sb_upsert('at_risk_members', {
+                await asyncio.to_thread(sb_upsert, 'at_risk_members', {
                     'member_id': m['id'], 'attendance_pct_last8': pct, 'consecutive_absences': consec,
                     'flagged_at': now_utc().isoformat(), 'resolved': False,
                 }, on_conflict='member_id')
