@@ -305,9 +305,34 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rollcall_button_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     chat_id = query.message.chat_id
+
     if chat_id not in active_meetings:
-        await query.answer("This meeting has ended.", show_alert=True)
-        return
+        # The bot may have restarted since this roll-call was posted,
+        # losing its in-memory tracking even though the meeting is
+        # genuinely still live. Re-check Supabase directly before
+        # concluding the meeting actually ended — this makes taps
+        # resilient to a mid-meeting redeploy instead of silently
+        # dropping them.
+        if chat_id in GROUP_IDS:
+            group_type = GROUP_IDS[chat_id]
+            meeting, mt = await asyncio.to_thread(get_or_create_meeting, chat_id, group_type)
+            if meeting and mt:
+                active_meetings[chat_id] = {
+                    'meeting_id':        meeting['id'],
+                    'scheduled_start':   meeting['scheduled_start'],
+                    'scheduled_end':     meeting['scheduled_end'],
+                    'grace_join_min':    mt.get('grace_join_minutes', 15),
+                    'grace_exit_min':    mt.get('grace_exit_minutes', 20),
+                    'present_threshold': mt.get('present_threshold_pct', 80),
+                    'partial_threshold': mt.get('partial_threshold_pct', 50),
+                    'rollcall_count':    0,
+                    'last_rollcall_at':  None,
+                }
+                log.info(f'Rebuilt meeting cache for chat_id={chat_id} after apparent restart')
+
+        if chat_id not in active_meetings:
+            await query.answer("This meeting has ended.", show_alert=True)
+            return
 
     tg_uid    = query.from_user.id
     member_id = await asyncio.to_thread(get_member_id, tg_uid)
