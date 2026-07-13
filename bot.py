@@ -275,7 +275,7 @@ async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not member_id:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="You're not linked to a CAMGlobal member account yet — ask an admin to link your Telegram to your WordPress profile."
+            text="You're not linked to a CAMGlobal member account yet — ask an admin to link your Telegram to your member profile."
         )
         return
 
@@ -353,9 +353,14 @@ async def post_rollcalls(context: ContextTypes.DEFAULT_TYPE):
         mt = await asyncio.to_thread(find_meeting_type, group_type, now)
 
         if not mt:
-            # No active meeting window right now — if one was tracked, finalise it.
+            # No active meeting window right now — if one was tracked in
+            # memory, finalise it normally. Also independently check
+            # Supabase for any meeting stuck 'live' past its scheduled
+            # end (e.g. from a bot restart mid-meeting) and finalise
+            # those too, regardless of what's in memory.
             if chat_id in active_meetings:
                 await finalise_meeting(context, chat_id)
+            await asyncio.to_thread(finalize_stale_live_meetings_sync, chat_id, now)
             continue
 
         if chat_id not in active_meetings:
@@ -402,6 +407,46 @@ async def finalise_meeting(context: ContextTypes.DEFAULT_TYPE, chat_id):
     seen_members = {e['member_id'] for e in evts}
     for member_id in seen_members:
         await asyncio.to_thread(calculate_attendance, cache['meeting_id'], member_id, cache)
+
+def finalize_stale_live_meetings_sync(chat_id, now):
+    """
+    Safety net for meetings still marked 'live' in Supabase whose
+    scheduled end time has already passed, but that never got finalised
+    because the bot restarted at some point and lost the in-memory
+    active_meetings entry that would normally trigger finalise_meeting().
+    Runs independently of any in-memory state, driven entirely by
+    what's actually stored in the database.
+    """
+    grp_rows = sb_get('telegram_groups', {'telegram_chat_id': f'eq.{chat_id}'})
+    if not grp_rows:
+        return
+    tg_group_id = grp_rows[0]['id']
+
+    live_meetings = sb_get('meetings', {
+        'telegram_group_id': f'eq.{tg_group_id}',
+        'status':            'eq.live',
+        'scheduled_end':     f'lt.{now.isoformat()}',
+    })
+    for m in live_meetings:
+        log.info(f'Finalising stale live meeting {m["id"]} (bot likely restarted mid-meeting)')
+        sb_patch('meetings', {'id': f'eq.{m["id"]}'}, {'status': 'ended', 'actual_end': now.isoformat()})
+
+        mt_rows = sb_get('meeting_types', {'id': f'eq.{m["meeting_type_id"]}'})
+        mt = mt_rows[0] if mt_rows else {}
+        cache = {
+            'scheduled_start':   m['scheduled_start'],
+            'scheduled_end':     m['scheduled_end'],
+            'grace_join_min':    mt.get('grace_join_minutes', 15),
+            'grace_exit_min':    mt.get('grace_exit_minutes', 20),
+            'present_threshold': mt.get('present_threshold_pct', 80),
+            'partial_threshold': mt.get('partial_threshold_pct', 50),
+            'rollcall_count':    0,
+        }
+
+        evts = sb_get('voice_events', {'meeting_id': f'eq.{m["id"]}', 'select': 'member_id'})
+        seen_members = {e['member_id'] for e in evts}
+        for member_id in seen_members:
+            calculate_attendance(m['id'], member_id, cache)
 
 async def check_at_risk(context: ContextTypes.DEFAULT_TYPE):
     try:
